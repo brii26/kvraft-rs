@@ -1,0 +1,35 @@
+syntax = "proto3";
+package appendentries;
+
+service Greeter {
+    rpc SayHello (AppendEntriesRequest) returns (AppendEntriesReply);
+}
+
+message AppendEntriesRequest {
+  int32 term = 1;
+  int32 leaderId = 2;
+  int32 prevLogIndex = 3;
+  int32 prevLogTerm = 4;
+  int32 leaderCommit = 5;
+  repeated Entries entries = 6;
+}
+
+message Entries {
+  int32 Index = 1;
+  bool isSet = 2;
+  bool isDel = 3;
+  bool isAppend = 4;
+  string key = 5;
+  optional string value = 6;
+}
+
+// Request:
+// term
+// candidateId
+// lastLogIndex
+// lastLogTerm
+
+message AppendEntriesReply {
+    int32 term = 1;
+    bool success = 2;
+}

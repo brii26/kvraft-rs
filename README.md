@@ -6,9 +6,9 @@
 
 | Nama           | NIM        |
 |----------------|------------|
-|    Anggota 1            |   NIM 1         |
-|    Anggota 2            |   NIM 2         |
-|    Anggota 3            |   NIM 3         |
+|        Brian Ricardo Tamin        |   13523126        |
+|    Boye Ginting            |   NIM 2         |
+|    Nathanael Rachmat            |   13523142        |
 
 ## Status Fitur
 <p>Note: status bisa (selesai, setengah jadi, blm selesai)</p><br/>
@@ -22,4 +22,3 @@
 | Unit Testing (bonus)| blm selesai  |
 | Transaction (bonus) | blm selesai  |
 | Log Compaciton (bonus)| blm selesai  |
-
