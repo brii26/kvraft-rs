@@ -12,6 +12,87 @@ pub mod test {
     tonic::include_proto!("test");
 }
 
+
+// STRUCT
+enum LogType {
+	ping,
+	get,
+	set,
+	append,
+	del,
+	strlen
+}
+
+pub struct Log {
+	type: LogType,
+	key: &String,
+	val: &String,
+}
+
+enum NodeType {
+	leader,
+	candidate,
+	follower
+}
+	
+pub struct Node {
+	address: &mut String, 						// Node Address
+	node_type: NodeType, 						// leader, candidate , follower
+	log: Vec<Log>,								// Stores Logs
+	data: HashMap<&String, &mut String>,		// Key value pair data
+	cluster_addr_list : List[String],			// Address List Cluster
+	cluster_leader_addr: String,				// Current Leader Address
+	election_term: i32,							// Current Election Term
+	voted_for: i32,								// Voting ID
+	commit_index: i32,							// Last Commit Index
+	last_applied: i32,							// Highes Log Entry Index
+	next_index: Vec<i32>,						// Expected Next Index Log
+	match_index: Vec<i32>,						// ndex of highest log entry known to be replicated on server
+}
+
+
+
+// STRUCT IMPLEMENTATION
+impl LogType {
+	fn ping() {
+
+	}
+	fn get() {
+
+	}
+	fn set() {
+
+	}
+	fn append() {
+
+	}
+	fn del() {
+
+	}
+	fn strlen() {
+
+	}
+}
+
+impl Log {
+	fn createLog(data : String) {
+		let new_log : Log = serde_json::from_str(data)?;
+		return new_log;
+	}
+}
+
+impl NodeType {
+	fn	init() {
+
+	}
+}
+
+impl Node {
+	fn init() {
+
+	}
+}
+
 #[derive(Debug)]
 pub struct MyTest {
     tx: tokio::sync::watch::Sender<i32>,
@@ -34,38 +115,6 @@ impl Test for MyTest {
         Ok(Response::new(reply))
     }
 }
-
-// enum LogType {
-//     set,
-//     delete,
-//     append,
-// }
-
-// pub struct Log {
-//     type: LogType,
-//     key: &String,
-//     val: &String,
-// }
-
-// pub struct Node {
-//     map: HashMap<&String, &mut String>,
-//     current_term: i32,
-//     voted_for: i32,
-//     log: Vec<Log>,
-//     commit_index: i32,
-//     last_applied: i32,
-//     next_index: Vec<i32>,
-//     match_index: Vec<i32>,
-//     my_port: &mut String,
-
-// }
-
-// impl Node {
-//     pub fn initialize(&mut self, port: &String) {
-//         println!{"TODO: initialize with port: {port}"};
-//     }
-//     pub fn
-// }
 
 async fn receiver(tx: tokio::sync::watch::Sender<i32>) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
