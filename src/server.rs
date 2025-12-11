@@ -1,9 +1,11 @@
 use tonic::{transport::Server, Request, Response, Status};
-// use std::collections::HashMap;
-// use std::thread;
+use tokio::runtime::Runtime;
+use tokio::time::{sleep, Duration};
 use hello_world::greeter_server::{Greeter, GreeterServer};
 use hello_world::{HelloReply, HelloRequest};
+use hello_world::greeter_client::GreeterClient;
 use std::env;
+
 pub mod hello_world {
     tonic::include_proto!("hello_world");
 }
@@ -14,7 +16,7 @@ pub struct MyGreeter {}
 #[derive(Debug, Default)]
 pub struct Timeout {}
 
-#[tonic::async_trait] // TODO: handle semua here termasuk bikin thread baru segala
+#[tonic::async_trait]
 impl Greeter for MyGreeter {
     async fn say_hello(
         &self,
@@ -63,8 +65,7 @@ impl Greeter for MyGreeter {
 // }
 
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn receiver() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     let query = &args[1]; 
     let mut addr_str = String::from("[::1]:");
@@ -81,9 +82,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-// inisialisasi server: broadcast ke ip address port tertentu --> kalau di respon berarti masuk ke
-// peer? list of known nodes.
-// abis itu ada service utk terima input: 
-// tapi selain service yang nungguin input, ada thread yang jalan sendiri yang actively memberi
-// request. setiap kali mau memberikan request bikin thread baru utk kirim grpc ke mrk gitu kali
-// yasdfgh
+async fn sender() -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..3 {
+        sleep(Duration::from_millis(1000)).await;
+        let args: Vec<String> = env::args().collect();
+        let query = &args[1];
+        let mut addr_str = String::from("http://[::1]:");
+        addr_str.push_str(query); 
+        let mut client = GreeterClient::connect(addr_str).await?;
+        let request = tonic::Request::new(HelloRequest {
+            name: "Hello".into(),
+        });
+
+        let response = client.say_hello(request).await?;
+
+        println!("RESPONSE={:?}", response);
+    }
+
+    Ok(())
+}
+
+
+fn main() {
+    let rt = Runtime::new().unwrap();
+    rt.block_on(async move {
+        println!("hello from the async block");
+        tokio::spawn(async { let _ = receiver().await; });
+        tokio::spawn(async { let _ = sender().await; });
+    });
+    loop {}
+}
