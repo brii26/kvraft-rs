@@ -8,6 +8,7 @@ pub mod test {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
+    if args.len() < 3 {panic!("Brow aint no way salah input: liat readme pls")}
     let ip_addr = &args[1];
     let port = &args[2];
     let mut addr_str = String::from("http://");

@@ -98,6 +98,9 @@ async fn sender(
 }
 
 fn main() {
+    let args: Vec<String> = env::args().collect();
+    if args.len() < 3 {panic!("Brow aint no way salah input: liat readme pls")}
+
     let rt = Runtime::new().unwrap();
     let (tx, mut rx) = watch::channel::<i32>(0);
 
