@@ -69,9 +69,12 @@ impl Test for MyTest {
 
 async fn receiver(tx: tokio::sync::watch::Sender<i32>) -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let query = &args[1];
-    let mut addr_str = String::from("[::1]:");
-    addr_str.push_str(query);
+    let ip_addr = &args[1];
+    let port = &args[2];
+    let mut addr_str = String::from("");
+    addr_str.push_str(ip_addr);
+    addr_str.push(':');
+    addr_str.push_str(port);
     let addr = addr_str.parse()?;
     let test = MyTest { tx: tx };
 

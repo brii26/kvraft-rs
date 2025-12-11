@@ -8,9 +8,12 @@ pub mod test {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    let query = &args[1];
-    let mut addr_str = String::from("http://[::1]:");
-    addr_str.push_str(query); 
+    let ip_addr = &args[1];
+    let port = &args[2];
+    let mut addr_str = String::from("http://");
+    addr_str.push_str(ip_addr);
+    addr_str.push(':');
+    addr_str.push_str(port); 
     let mut client = TestClient::connect(addr_str).await?;
     let request = tonic::Request::new(TestRequest {
         name: "Hello".into(),

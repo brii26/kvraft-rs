@@ -22,3 +22,10 @@
 | Unit Testing (bonus)| blm selesai  |
 | Transaction (bonus) | blm selesai  |
 | Log Compaciton (bonus)| blm selesai  |
+
+## Cara Menjalankannya
+```
+cargo build
+cargo run --bin server <ip_addr> <port>
+cargo run --bin client <ip_addr> <port>
+```
