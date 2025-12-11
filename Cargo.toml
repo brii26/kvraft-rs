@@ -1,14 +1,14 @@
 [package]
-name = "helloworld-tonic"
+name = "raft-protocol"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]] # Bin to run the HelloWorld gRPC server
-name = "helloworld-server"
+name = "server"
 path = "src/server.rs"
 
 [[bin]] # Bin to run the HelloWorld gRPC client
-name = "helloworld-client"
+name = "client"
 path = "src/client.rs"
 
 [dependencies]

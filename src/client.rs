@@ -1,8 +1,8 @@
-use hello_world::greeter_client::GreeterClient;
-use hello_world::HelloRequest;
+use test::test_client::TestClient;
+use test::TestRequest;
 use std::env;
-pub mod hello_world {
-    tonic::include_proto!("hello_world");
+pub mod test {
+    tonic::include_proto!("test");
 }
 
 #[tokio::main]
@@ -11,12 +11,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let query = &args[1];
     let mut addr_str = String::from("http://[::1]:");
     addr_str.push_str(query); 
-    let mut client = GreeterClient::connect(addr_str).await?;
-    let request = tonic::Request::new(HelloRequest {
+    let mut client = TestClient::connect(addr_str).await?;
+    let request = tonic::Request::new(TestRequest {
         name: "Hello".into(),
     });
 
-    let response = client.say_hello(request).await?;
+    let response = client.request(request).await?;
 
     println!("RESPONSE={:?}", response);
 

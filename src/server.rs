@@ -1,30 +1,30 @@
 use tonic::{transport::Server, Request, Response, Status};
 use tokio::runtime::Runtime;
 use tokio::time::{sleep, Duration};
-use hello_world::greeter_server::{Greeter, GreeterServer};
-use hello_world::{HelloReply, HelloRequest};
-use hello_world::greeter_client::GreeterClient;
+use test::test_server::{Test, TestServer};
+use test::{TestReply, TestRequest};
+use test::test_client::TestClient;
 use std::env;
 
-pub mod hello_world {
-    tonic::include_proto!("hello_world");
+pub mod test {
+    tonic::include_proto!("test");
 }
 
 #[derive(Debug, Default)]
-pub struct MyGreeter {}
+pub struct MyTest {}
 
 #[derive(Debug, Default)]
 pub struct Timeout {}
 
 #[tonic::async_trait]
-impl Greeter for MyGreeter {
-    async fn say_hello(
+impl Test for MyTest {
+    async fn request(
         &self,
-        request: Request<HelloRequest>,
-    ) -> Result<Response<HelloReply>, Status> {
+        request: Request<TestRequest>,
+    ) -> Result<Response<TestReply>, Status> {
         println!("Got a request: {:?}", request);
 
-        let reply = HelloReply {
+        let reply = TestReply {
             message: format!("Hello {}!", request.into_inner().name),
         };
 
@@ -71,10 +71,10 @@ async fn receiver() -> Result<(), Box<dyn std::error::Error>> {
     let mut addr_str = String::from("[::1]:");
     addr_str.push_str(query);
     let addr = addr_str.parse()?;
-    let greeter = MyGreeter::default();
+    let test = MyTest::default();
 
     Server::builder()
-        .add_service(GreeterServer::new(greeter))
+        .add_service(TestServer::new(test))
         .serve(addr)
         .await?;
 
@@ -89,12 +89,12 @@ async fn sender() -> Result<(), Box<dyn std::error::Error>> {
         let query = &args[1];
         let mut addr_str = String::from("http://[::1]:");
         addr_str.push_str(query); 
-        let mut client = GreeterClient::connect(addr_str).await?;
-        let request = tonic::Request::new(HelloRequest {
+        let mut client = TestClient::connect(addr_str).await?;
+        let request = tonic::Request::new(TestRequest {
             name: "Hello".into(),
         });
 
-        let response = client.say_hello(request).await?;
+        let response = client.request(request).await?;
 
         println!("RESPONSE={:?}", response);
     }
