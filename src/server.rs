@@ -145,33 +145,22 @@ impl Node {
     async fn handle_command(&mut self, msg: Command) {
         match msg {
             Command::Init { result_sender } => {
-                println!("test1");
-                let mut client = RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await.expect("cannot find contact ip address");
+                loop {
+                    let mut client = RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await.expect("cannot find contact ip address");
+                    let request = tonic::Request::new(MembershipRequest {
+                        ip_addr: (self.address.ip.clone()),
+                        port: (self.address.port.clone()),
+                    });
+                    let mut response = client.membership(request).await;
+                    let status = response.as_mut().unwrap().get_ref().status;
 
-                let request = tonic::Request::new(MembershipRequest {
-                    ip_addr: (self.address.ip.clone()),
-                    port: (self.address.port.clone()),
-                });
+                    if status {break;}
 
-                let mut response = client.membership(request).await;
-				let mut status = !response.as_mut().unwrap().get_ref().status;
-
-				while status {
-					self.cluster_leader_addr = Address {
-						ip: response.as_mut().unwrap().get_ref().ip_addr.clone(),
-						port:  response.as_mut().unwrap().get_ref().port.clone(),
-					};
-
-					client = RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await.expect("cannot find contact ip address");
-					let request = tonic::Request::new(MembershipRequest {
-						ip_addr: (self.address.ip.clone()),
-						port: (self.address.port.clone()),
-					});
-
-					response = client.membership(request).await;
-					status = !response.as_mut().unwrap().get_ref().status;
-					println!("{}",status);
-				}
+                    self.cluster_leader_addr = Address {
+                        ip: response.as_mut().unwrap().get_ref().ip_addr.clone(),
+                        port:  response.as_mut().unwrap().get_ref().port.clone(),
+                    };
+                }
 
                 println!("Init successful");
                 let _ = result_sender.send(Ok(()));
