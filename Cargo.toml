@@ -15,7 +15,7 @@ path = "src/client.rs"
 tonic = "*"
 prost = "0.14"
 tonic-prost = "*"
-tokio = { version = "1.0", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread","signal"] }
 serde = { version = "1.0.104", features = ["derive"] }
 serde_json = "1.0.48"
 
