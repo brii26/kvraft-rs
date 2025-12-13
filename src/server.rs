@@ -132,7 +132,7 @@ async fn run_my_actor(mut actor: Node) {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct MyActorHandle {
     sender: mpsc::Sender<Command>,
 }
@@ -185,6 +185,7 @@ impl Log {
 #[derive(Debug)]
 pub struct MyRaftService {
     tx: tokio::sync::watch::Sender<i32>,
+    handler: MyActorHandle,
 }
 
 #[derive(Debug, Default)]
@@ -251,7 +252,10 @@ async fn receiver(
     addr_str.push(':');
     addr_str.push_str(port);
     let addr = addr_str.parse()?;
-    let raft_service = MyRaftService { tx: tx };
+    let raft_service = MyRaftService {
+        tx,
+        handler: actor_handler,
+    };
 
     Server::builder()
         .add_service(RaftServiceServer::new(raft_service))
@@ -287,12 +291,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let my_actor_handle = MyActorHandle::new(my_address.clone(), NodeType::LEADER, my_address);
     let my_actor_handler_clone = my_actor_handle.clone();
-
-    println!("{:?}", my_actor_handle.get_address().await);
-
-    my_actor_handler_clone
-        .change_address("127.0.0.2".to_string())
-        .await;
 
     println!("{:?}", my_actor_handle.get_address().await);
 
