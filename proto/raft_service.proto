@@ -54,13 +54,13 @@ message VoteRequest {
 
 // Append Entries 
 message MembershipRequest {
-	optional string ipAddr = 1;
-	optional string port = 2;
+	string ipAddr = 1;
+	string port = 2;
 }
 
 message MembershipReply { 
-	optional string ipAddr  = 1;
-	optional string port = 2;
-	optional bool status = 3; // "redirected" -> 0 || "OK" -> 1
+	string ipAddr  = 1;
+	string port = 2;
+	bool status = 3; // "redirected" -> 0 || "OK" -> 1
 
 }

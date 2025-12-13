@@ -1,4 +1,6 @@
 use raft_service::raft_service_server::{RaftService, RaftServiceServer};
+use raft_service::raft_service_client::RaftServiceClient;
+
 use raft_service::{
     AppendReply, AppendRequest, ClientReply, ClientRequest, MembershipReply, MembershipRequest,
     VoteReply, VoteRequest,
@@ -10,6 +12,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio::time::{sleep, Duration};
 use tonic::{transport::Server, Request, Response, Status};
+
 
 pub mod raft_service {
     tonic::include_proto!("raft_service");
@@ -31,6 +34,7 @@ pub struct Log {
     val: String,
 }
 
+#[derive(Clone, PartialEq)]
 pub enum NodeType {
     LEADER,
     CANDIDATE,
@@ -43,6 +47,16 @@ pub struct Address {
     port: String,
 }
 
+impl Address {
+    pub fn to_string(&self) -> String {
+    let mut addr_str = String::from("http://");
+    addr_str.push_str(&self.ip);
+    addr_str.push(':');
+    addr_str.push_str(&self.port);
+    addr_str
+    }
+}
+
 impl PartialEq for Address {
     fn eq(&self, other: &Self) -> bool {
         self.ip == other.ip && self.port == other.port
@@ -50,8 +64,12 @@ impl PartialEq for Address {
 }
 
 pub enum Command {
-    // Init,
-    // InitAsLeader,
+    Init {
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
+    InitAsLeader {
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
     // SendMembership,
     // GetMembership,
     // SendEntries,
@@ -63,9 +81,19 @@ pub enum Command {
     GetAddress {
         result_sender: oneshot::Sender<Address>,
     },
+    GetType {
+        result_sender: oneshot::Sender<NodeType>,
+    },
+    GetLeader {
+        result_sender: oneshot:: Sender<Address>,
+    },
+    AddMember {
+        address: Address,
+        result_sender: oneshot::Sender<Result<(),()>>,
+    },
     ChangeAddress {
         ip: String,
-        result_sender: oneshot::Sender<Result<String, ()>>,
+        result_sender: oneshot::Sender<Result<(),()>>,
     },
 }
 
@@ -75,7 +103,7 @@ pub struct Node {
     node_type: NodeType,            // leader, candidate , follower
     log: Vec<Log>,                  // Stores Logs
     data: HashMap<String, String>,  // Key value pair data
-    cluster_addr_list: Vec<String>, // Address List Cluster
+    cluster_addr_list: Vec<Address>, // Address List Cluster
     cluster_leader_addr: Address,   // Current Leader Address
     election_term: i32,             // Current Election Term
     voted_for: Option<Address>,     // Voting ID
@@ -112,15 +140,49 @@ impl Node {
             match_index: Vec::new(),
         }
     }
-    fn handle_command(&mut self, msg: Command) {
+    async fn handle_command(&mut self, msg: Command) {
         match msg {
-            Command::GetAddress { result_sender } => {
+            Command::Init { result_sender } => {
+                println!("test1");
+                let mut client = RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await.expect("cannot find contact ip address");
+
+                let request = tonic::Request::new(MembershipRequest {
+                    ip_addr: (self.address.ip.clone()),
+                    port: (self.address.port.clone()),
+                });
+
+                let response = client.membership(request).await;
+
+                println!("RESPONSE={:?}", response);
+                println!("Init successful");
+                let _ = result_sender.send(Ok(()));
+
+            }
+            Command::InitAsLeader { result_sender } => {
+                self.cluster_addr_list.push(self.address.clone());
+                println!("Init as leader successful");
+                let _ = result_sender.send(Ok(()));
+            }
+            Command::GetType { result_sender } => {
+                let _ = result_sender.send(self.node_type.clone());
+            }
+            Command::GetLeader { result_sender } => {
                 let _ = result_sender.send(self.address.clone());
+            }
+
+            Command::GetAddress { result_sender } => {
+                let _ = result_sender.send(self.cluster_leader_addr.clone());
             }
             Command::ChangeAddress { ip, result_sender } => {
                 self.address.ip = ip;
-                println!("Print: Change is successful");
-                let _ = result_sender.send(Ok(format!("Change Successful")));
+                println!("Change is successful");
+                let _ = result_sender.send(Ok(()));
+            }
+
+            Command::AddMember { address, result_sender } => {
+                self.cluster_addr_list.push(address);
+                println!("Add membership is successful");
+                let _ = result_sender.send(Ok(()));
             }
         }
     }
@@ -128,7 +190,7 @@ impl Node {
 
 async fn run_my_actor(mut actor: Node) {
     while let Some(msg) = actor.receiver.recv().await {
-        actor.handle_command(msg);
+        actor.handle_command(msg).await;
     }
 }
 
@@ -143,6 +205,24 @@ impl MyActorHandle {
         let actor = Node::new(receiver, address, node_type, cluster_leader_addr);
         tokio::spawn(run_my_actor(actor));
         Self { sender }
+    }
+
+    pub async fn init(&self) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::Init {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+
+    pub async fn init_as_leader(&self) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::InitAsLeader {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
     }
 
     pub async fn get_address(&self) -> Address {
@@ -162,6 +242,34 @@ impl MyActorHandle {
         };
         let _ = self.sender.send(msg).await;
         let _ = recv.await.expect("Actor task has been killed");
+    }
+
+    pub async fn get_type(&self) -> NodeType {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::GetType {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+
+    pub async fn get_leader(&self) -> Address {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::GetLeader {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+    
+    pub async fn add_member(&self, address: Address) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::AddMember {
+            address,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let res = recv.await.expect("Actor task has been killed");
     }
 }
 
@@ -231,11 +339,26 @@ impl RaftService for MyRaftService {
         &self,
         request: Request<MembershipRequest>,
     ) -> Result<Response<MembershipReply>, Status> {
-        let reply = MembershipReply {
-            ip_addr: Some("0.0.0.0".to_string()),
-            port: Some("0000".to_string()),
-            status: Some(true),
+
+        let leader_addr = self.handler.get_leader().await;
+
+         let mut reply = MembershipReply {
+            ip_addr: leader_addr.ip,
+            port: leader_addr.port,
+            status: true,
         };
+
+
+        if self.handler.get_type().await != NodeType::LEADER {
+           reply.status=false; 
+        } else {
+            let new_addr = Address {
+                ip: request.get_ref().ip_addr.clone(),
+                port: request.get_ref().port.clone(),
+            };
+            self.handler.add_member(new_addr).await;
+        }
+
         Ok(Response::new(reply))
     }
 }
@@ -269,6 +392,11 @@ async fn sender(
     rx: &mut tokio::sync::watch::Receiver<i32>,
     actor_handler: MyActorHandle,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    if actor_handler.get_type().await == NodeType::LEADER{
+        actor_handler.init_as_leader().await;
+    } else {
+        actor_handler.init().await;
+    }
     loop {
         match timeout(Duration::from_millis(5000), rx.changed()).await {
             Ok(_) => println!("not time out yayyy"),
@@ -289,22 +417,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         port: args[2].clone(),
     };
 
-    let my_actor_handle = MyActorHandle::new(my_address.clone(), NodeType::LEADER, my_address);
-    let my_actor_handler_clone = my_actor_handle.clone();
 
-    println!("{:?}", my_actor_handle.get_address().await);
+    if args.len() == 5 {
+        let leader_address = Address {
+            ip: args[3].clone(),
+            port: args[4].clone(),
+        };
+        let my_actor_handle = MyActorHandle::new(my_address, NodeType::FOLLOWER, leader_address);
+        let my_actor_handler_clone = my_actor_handle.clone();
+        println!("{:?}", my_actor_handle.get_address().await);
+        let (tx, mut rx) = watch::channel::<i32>(0);
+        tokio::spawn(async {
+            let _ = receiver(tx, my_actor_handle).await;
+        });
+        tokio::spawn(async move {
+            let _ = sender(&mut rx, my_actor_handler_clone).await;
+        });
+        let ctrl_c = signal::ctrl_c();
+        println!("Press Ctrl+C to exit...");
+        ctrl_c.await.expect("Ctrl+C signal failed");
+        println!("Ctrl+C received. Exiting...");
+        Ok(())
 
-    let (tx, mut rx) = watch::channel::<i32>(0);
+    } else {
+        let my_actor_handle = MyActorHandle::new(my_address.clone(), NodeType::LEADER, my_address);
 
-    tokio::spawn(async {
-        let _ = receiver(tx, my_actor_handle).await;
-    });
-    tokio::spawn(async move {
-        let _ = sender(&mut rx, my_actor_handler_clone).await;
-    });
-    let ctrl_c = signal::ctrl_c();
-    println!("Press Ctrl+C to exit...");
-    ctrl_c.await.expect("Ctrl+C signal failed");
-    println!("Ctrl+C received. Exiting...");
-    Ok(())
+        let my_actor_handler_clone = my_actor_handle.clone();
+
+        println!("{:?}", my_actor_handle.get_address().await);
+
+        let (tx, mut rx) = watch::channel::<i32>(0);
+
+        tokio::spawn(async {
+            let _ = receiver(tx, my_actor_handle).await;
+        });
+        tokio::spawn(async move {
+            let _ = sender(&mut rx, my_actor_handler_clone).await;
+        });
+        let ctrl_c = signal::ctrl_c();
+        println!("Press Ctrl+C to exit...");
+        ctrl_c.await.expect("Ctrl+C signal failed");
+        println!("Ctrl+C received. Exiting...");
+        Ok(())
+    }
+    
+
 }
