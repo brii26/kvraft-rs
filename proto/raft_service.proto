@@ -19,25 +19,25 @@ message ClientReply {
 
 // Append Entries 
 message Entries {
-	optional int32 Index = 1;
-	optional bool isSet = 2;
-	optional bool isDel = 3;
-	optional bool isAppend = 4;
-	optional string key = 5;
-	optional string value = 6;
+	bool isSet = 2;
+	bool isDel = 3;
+	bool isAppend = 4;
+	string key = 5;
+	string value = 6;
 }
+
 message AppendRequest {
-  optional int32 term = 1;
-  optional int32 leaderId = 2;
-  optional int32 prevLogIndex = 3;
-  optional int32 prevLogTerm = 4;
-  optional int32 leaderCommit = 5;
+  int32 term = 1;
+  int32 leaderId = 2;
+  int32 prevLogIndex = 3;
+  int32 prevLogTerm = 4;
+  int32 leaderCommit = 5;
   repeated Entries entries = 6;
-  repeated string cluster_addr_list = 7;
+  repeated Address cluster_addr_list = 7;
 }
 message AppendReply {
-    optional int32 term = 1;
-    optional bool success = 2;
+    int32 term = 1;
+    bool success = 2;
 }
 
 // Vote Request
@@ -62,5 +62,9 @@ message MembershipReply {
 	string ipAddr  = 1;
 	string port = 2;
 	bool status = 3; // "redirected" -> 0 || "OK" -> 1
+}
 
+message Address {
+  string ip = 1;
+  string port = 2;
 }
