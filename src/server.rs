@@ -5,6 +5,7 @@ use raft_service::{
     AppendReply, AppendRequest, ClientReply, ClientRequest, MembershipReply, MembershipRequest,
     VoteReply, VoteRequest,
 };
+use std::any::Any;
 use std::collections::HashMap;
 use std::env;
 use tokio::signal;
@@ -49,11 +50,11 @@ pub struct Address {
 
 impl Address {
     pub fn to_string(&self) -> String {
-    let mut addr_str = String::from("http://");
-    addr_str.push_str(&self.ip);
-    addr_str.push(':');
-    addr_str.push_str(&self.port);
-    addr_str
+		let mut addr_str = String::from("http://");
+		addr_str.push_str(&self.ip);
+		addr_str.push(':');
+		addr_str.push_str(&self.port);
+		addr_str
     }
 }
 
@@ -113,6 +114,7 @@ pub struct Node {
     match_index: Vec<i32>,          // ndex of highest log entry known to be replicated on server
 }
 
+
 impl Node {
     fn new(
         receiver: mpsc::Receiver<Command>,
@@ -151,9 +153,26 @@ impl Node {
                     port: (self.address.port.clone()),
                 });
 
-                let response = client.membership(request).await;
+                let mut response = client.membership(request).await;
+				let mut status = !response.as_mut().unwrap().get_ref().status;
 
-                println!("RESPONSE={:?}", response);
+				while status {
+					self.cluster_leader_addr = Address {
+						ip: response.as_mut().unwrap().get_ref().ip_addr.clone(),
+						port:  response.as_mut().unwrap().get_ref().port.clone(),
+					};
+
+					client = RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await.expect("cannot find contact ip address");
+					let request = tonic::Request::new(MembershipRequest {
+						ip_addr: (self.address.ip.clone()),
+						port: (self.address.port.clone()),
+					});
+
+					response = client.membership(request).await;
+					status = !response.as_mut().unwrap().get_ref().status;
+					println!("{}",status);
+				}
+
                 println!("Init successful");
                 let _ = result_sender.send(Ok(()));
 
@@ -167,11 +186,11 @@ impl Node {
                 let _ = result_sender.send(self.node_type.clone());
             }
             Command::GetLeader { result_sender } => {
-                let _ = result_sender.send(self.address.clone());
+                let _ = result_sender.send(self.cluster_leader_addr.clone());
             }
 
             Command::GetAddress { result_sender } => {
-                let _ = result_sender.send(self.cluster_leader_addr.clone());
+                let _ = result_sender.send(self.address.clone());
             }
             Command::ChangeAddress { ip, result_sender } => {
                 self.address.ip = ip;
@@ -342,11 +361,12 @@ impl RaftService for MyRaftService {
 
         let leader_addr = self.handler.get_leader().await;
 
-         let mut reply = MembershipReply {
+        let mut reply = MembershipReply {
             ip_addr: leader_addr.ip,
             port: leader_addr.port,
             status: true,
         };
+		println!("{:?}",reply.ip_addr);
 
 
         if self.handler.get_type().await != NodeType::LEADER {
@@ -359,6 +379,7 @@ impl RaftService for MyRaftService {
             self.handler.add_member(new_addr).await;
         }
 
+		println!("{}",reply.status);
         Ok(Response::new(reply))
     }
 }
