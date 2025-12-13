@@ -1,8 +1,8 @@
-use test::test_client::TestClient;
-use test::TestRequest;
+use raft_service::raft_service_client::RaftServiceClient;
+use raft_service::{ClientRequest, ClientReply};
 use std::env;
-pub mod test {
-    tonic::include_proto!("test");
+pub mod raft_service {
+    tonic::include_proto!("raft_service");
 }
 
 #[tokio::main]
@@ -15,12 +15,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     addr_str.push_str(ip_addr);
     addr_str.push(':');
     addr_str.push_str(port); 
-    let mut client = TestClient::connect(addr_str).await?;
-    let request = tonic::Request::new(TestRequest {
+    let mut client = RaftServiceClient::connect(addr_str).await?;
+    let request = tonic::Request::new(ClientRequest {
         name: "Hello".into(),
     });
 
-    let response = client.request(request).await?;
+    let response = client.client(request).await?;
 
     println!("RESPONSE={:?}", response);
 
