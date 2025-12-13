@@ -5,6 +5,7 @@ service RaftService{
     rpc Client (ClientRequest) returns (ClientReply);
 	rpc AppendEntries (AppendRequest) returns (AppendReply);
 	rpc VoteMe (VoteRequest) returns (VoteReply);
+	rpc Membership (MembershipRequest) returns (MembershipReply);
 }
 
 

@@ -136,6 +136,14 @@ impl RaftService for MyRaftService {
 		Ok(Response::new(reply))
 	}
 
+	async fn membership(&self, request: Request <MembershipRequest>) -> Result<Response<MembershipReply>, Status> {
+		let reply = MembershipReply {
+			ip_addr: Some("0.0.0.0".to_string()),
+			port: Some("0000".to_string()),
+			status : Some(true)
+		};
+		Ok(Response::new(reply))
+	}
 }
 
 async fn receiver(tx: tokio::sync::watch::Sender<i32>) -> Result<(), Box<dyn std::error::Error>> {
