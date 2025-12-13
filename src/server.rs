@@ -1,46 +1,46 @@
 use std::env;
-// use test::test_client::TestClient;
-use test::test_server::{Test, TestServer};
-use test::{TestReply, TestRequest};
+use std::collections::HashMap;
+use raft_service::raft_service_server::{RaftService, RaftServiceServer};
+use raft_service::{ClientRequest, ClientReply, AppendRequest, AppendReply, VoteRequest, VoteReply};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
 use tokio::time::timeout;
 use tokio::time::{sleep, Duration};
 use tonic::{transport::Server, Request, Response, Status};
 
-pub mod test {
-    tonic::include_proto!("test");
+pub mod raft_service {
+    tonic::include_proto!("raft_service");
 }
 
 
 // STRUCT
 enum LogType {
-	ping,
-	get,
-	set,
-	append,
-	del,
-	strlen
+	PING,
+	GET,
+	SET,
+	APPEND,
+	DEL,
+	STRLEN
 }
 
-pub struct Log {
-	type: LogType,
-	key: &String,
-	val: &String,
+pub struct Log<'a> {
+	log_type: LogType,
+	key: &'a String,
+	val: &'a String,
 }
 
 enum NodeType {
-	leader,
-	candidate,
-	follower
+	LEADER,
+	CANDIDATE,
+	FOLLOWER
 }
 	
-pub struct Node {
-	address: &mut String, 						// Node Address
+pub struct Node<'a> {
+	address: &'a mut String, 					// Node Address
 	node_type: NodeType, 						// leader, candidate , follower
-	log: Vec<Log>,								// Stores Logs
-	data: HashMap<&String, &mut String>,		// Key value pair data
-	cluster_addr_list : List[String],			// Address List Cluster
+	log: Vec<Log<'a>>,							// Stores Logs
+	data: HashMap<&'a String, &'a mut String>,	// Key value pair data
+	cluster_addr_list : Vec<String>,			// Address List Cluster
 	cluster_leader_addr: String,				// Current Leader Address
 	election_term: i32,							// Current Election Term
 	voted_for: i32,								// Voting ID
@@ -74,11 +74,11 @@ impl LogType {
 	}
 }
 
-impl Log {
-	fn createLog(data : String) {
-		let new_log : Log = serde_json::from_str(data)?;
-		return new_log;
-	}
+impl Log<'_> {
+	// fn createLog(&data : String) {
+	// 	let new_log : Log = serde_json::from_str(&data)?;
+	// 	return new_log;
+	// }
 }
 
 impl NodeType {
@@ -87,14 +87,14 @@ impl NodeType {
 	}
 }
 
-impl Node {
+impl Node<'_> {
 	fn init() {
 
 	}
 }
 
 #[derive(Debug)]
-pub struct MyTest {
+pub struct MyRaftService {
     tx: tokio::sync::watch::Sender<i32>,
 }
 
@@ -102,10 +102,11 @@ pub struct MyTest {
 pub struct Timeout {}
 
 #[tonic::async_trait]
-impl Test for MyTest {
-    async fn request(&self, request: Request<TestRequest>) -> Result<Response<TestReply>, Status> {
+impl RaftService for MyRaftService {
+
+	async fn client(&self, request: Request<ClientRequest>) -> Result<Response<ClientReply>, Status> {
         // println!("Got a request: {:?}", request);
-        let reply = TestReply {
+        let reply = ClientReply {
             message: format!("Hello {}!", request.into_inner().name),
         };
 
@@ -114,6 +115,23 @@ impl Test for MyTest {
 
         Ok(Response::new(reply))
     }
+
+	async fn append_entries(&self, request: Request <AppendRequest>) -> Result<Response<AppendReply>, Status> {
+		let reply = AppendReply {
+			term: Some(0),
+			success: Some(false),
+		};
+		Ok(Response::new(reply))
+	}
+
+	async fn vote_me(&self, request: Request <VoteRequest>) -> Result<Response<VoteReply>, Status> {
+		let reply = VoteReply {
+			term: Some(0),
+			vote_granted: Some(false),
+		};
+		Ok(Response::new(reply))
+	}
+
 }
 
 async fn receiver(tx: tokio::sync::watch::Sender<i32>) -> Result<(), Box<dyn std::error::Error>> {
@@ -125,10 +143,10 @@ async fn receiver(tx: tokio::sync::watch::Sender<i32>) -> Result<(), Box<dyn std
     addr_str.push(':');
     addr_str.push_str(port);
     let addr = addr_str.parse()?;
-    let test = MyTest { tx: tx };
+    let raft_service = MyRaftService { tx: tx };
 
     Server::builder()
-        .add_service(TestServer::new(test))
+        .add_service(RaftServiceServer::new(raft_service))
         .serve(addr)
         .await?;
 

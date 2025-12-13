@@ -1,0 +1,51 @@
+syntax = "proto3";
+package raft_service;
+
+service RaftService{
+    rpc Client (ClientRequest) returns (ClientReply);
+	rpc AppendEntries (AppendRequest) returns (AppendReply);
+	rpc VoteMe (VoteRequest) returns (VoteReply);
+}
+
+
+// Client Entries
+message ClientRequest { 
+	string name = 1; 
+}
+message ClientReply { 
+	string message = 1; 
+}
+
+// Append Entries 
+message Entries {
+	optional int32 Index = 1;
+	optional bool isSet = 2;
+	optional bool isDel = 3;
+	optional bool isAppend = 4;
+	optional string key = 5;
+	optional string value = 6;
+}
+message AppendRequest {
+  optional int32 term = 1;
+  optional int32 leaderId = 2;
+  optional int32 prevLogIndex = 3;
+  optional int32 prevLogTerm = 4;
+  optional int32 leaderCommit = 5;
+  repeated Entries entries = 6;
+}
+message AppendReply {
+    optional int32 term = 1;
+    optional bool success = 2;
+}
+
+// Vote Request
+message VoteRequest {
+	optional int32 term = 1;
+	optional int32 candidateId = 2;
+	optional int32 lastLogIndex = 3;
+	optional int32 lastLogTerm = 4;
+ }
+ message VoteReply {
+	 optional int32 term = 1;
+	 optional bool voteGranted = 2;
+ }
