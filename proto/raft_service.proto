@@ -42,14 +42,14 @@ message AppendReply {
 
 // Vote Request
 message VoteRequest {
-	optional int32 term = 1;
-	optional int32 candidateId = 2;
-	optional int32 lastLogIndex = 3;
-	optional int32 lastLogTerm = 4;
+	  int32 term = 1;
+	  int32 candidateId = 2;
+	  int32 lastLogIndex = 3;
+	  int32 lastLogTerm = 4;
  }
  message VoteReply {
-	 optional int32 term = 1;
-	 optional bool voteGranted = 2;
+	  int32 term = 1;
+    bool voteGranted = 2;
  }
 
 // Append Entries 
@@ -62,9 +62,11 @@ message MembershipReply {
 	string ipAddr  = 1;
 	string port = 2;
 	bool status = 3; // "redirected" -> 0 || "OK" -> 1
+  int32 id = 4;
 }
 
 message Address {
   string ip = 1;
   string port = 2;
+  int32 cluster_idx = 3;
 }
