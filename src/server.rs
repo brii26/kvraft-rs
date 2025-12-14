@@ -202,6 +202,10 @@ pub enum Command {
         cluster_idx: i32,
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
+    SetLeader {
+        cluster_idx: i32,
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
     ReInit {
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
@@ -530,6 +534,14 @@ impl Node {
                 self.voted_for = Some(address);
                 let _ = result_sender.send(Ok(()));
             }
+            Command::SetLeader {
+                cluster_idx,
+                result_sender,
+            } => {
+                let address = self.cluster_addr_list[cluster_idx as usize].clone();
+                self.cluster_leader_addr = address;
+                let _ = result_sender.send(Ok(()));
+            }
         }
     }
 }
@@ -768,6 +780,15 @@ impl MyActorHandle {
         let _ = self.sender.send(msg).await;
         let _ = recv.await.expect("Actor task has been killed");
     }
+    pub async fn set_leader(&self, cluster_idx: i32) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::SetLeader {
+            cluster_idx,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
     pub async fn send_vote(&self, index: i32) -> bool {
         let (send, recv) = oneshot::channel();
         let msg = Command::SendVote {
@@ -838,10 +859,13 @@ impl RaftService for MyRaftService {
         } else {
             self.handler.change_type(NodeType::FOLLOWER).await;
             self.handler.set_term(request_raw.term).await;
+            // request_raw.leader_id
+            println!("i got the leader id: {:?}", request_raw.leader_id);
 
             self.handler
                 .update_cluster(request_raw.cluster_addr_list.clone())
                 .await;
+            self.handler.set_leader(request_raw.leader_id).await;
             if request_raw.entries.len() == 0 {
                 let reply = AppendReply {
                     term: self.handler.get_term().await,
