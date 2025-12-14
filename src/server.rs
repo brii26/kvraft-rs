@@ -64,7 +64,7 @@ pub fn check_up_to_date(src: Vec<Log>, lastlogindex: i32, lastlogterm: i32) -> b
     true
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Debug)]
 pub enum NodeType {
     LEADER,
     CANDIDATE,
@@ -202,6 +202,9 @@ pub enum Command {
         cluster_idx: i32,
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
+    ReInit {
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
 }
 
 pub struct Node {
@@ -288,6 +291,10 @@ impl Node {
                 println!("Init successful");
                 let _ = result_sender.send(Ok(()));
             }
+            Command::ReInit { result_sender } => {
+                self.cluster_leader_addr = self.address.clone();
+                let _ = result_sender.send(Ok(()));
+            }
             Command::InitAsLeader { result_sender } => {
                 self.cluster_addr_list.push(self.address.clone());
                 self.election_term = 1;
@@ -314,7 +321,7 @@ impl Node {
                                     .expect("cannot find ip addr");
                                 let request = tonic::Request::new(AppendRequest {
                                     term: self.election_term,
-                                    leader_id: self.cluster_leader_addr.cluster_idx,
+                                    leader_id: self.address.cluster_idx,
                                     prev_log_index: self.log.len() as i32 - 1,
                                     prev_log_term: lastlog.term,
                                     leader_commit: self.commit_index,
@@ -325,20 +332,27 @@ impl Node {
                                 let _ = result_sender.send(response.unwrap().get_ref().success);
                             }
                             None => {
-                                let mut client = RaftServiceClient::connect(x.to_string())
-                                    .await
-                                    .expect("cannot find ip addr");
-                                let request = tonic::Request::new(AppendRequest {
-                                    term: self.election_term,
-                                    leader_id: self.cluster_leader_addr.cluster_idx,
-                                    prev_log_index: self.log.len() as i32 - 1,
-                                    prev_log_term: -1,
-                                    leader_commit: self.commit_index,
-                                    entries: self.entries_to_send.clone(),
-                                    cluster_addr_list: self.converted.clone(),
-                                });
-                                let response = client.append_entries(request).await;
-                                let _ = result_sender.send(response.unwrap().get_ref().success);
+                                let conn = RaftServiceClient::connect(x.to_string()).await;
+
+                                match conn {
+                                    Ok(mut client) => {
+                                        let request = tonic::Request::new(AppendRequest {
+                                            term: self.election_term,
+                                            leader_id: self.cluster_leader_addr.cluster_idx,
+                                            prev_log_index: self.log.len() as i32 - 1,
+                                            prev_log_term: -1,
+                                            leader_commit: self.commit_index,
+                                            entries: self.entries_to_send.clone(),
+                                            cluster_addr_list: self.converted.clone(),
+                                        });
+                                        let response = client.append_entries(request).await;
+                                        let _ =
+                                            result_sender.send(response.unwrap().get_ref().success);
+                                    }
+                                    Err(_) => {
+                                        let _ = result_sender.send(false);
+                                    }
+                                }
                             }
                         }
                     }
@@ -396,6 +410,7 @@ impl Node {
             }
             Command::PrepareVote { result_sender } => {
                 self.election_term += 1;
+                self.voted_for = Some(self.address.clone());
                 let _ = result_sender.send(Ok(()));
             }
             Command::UpdateCluster {
@@ -453,8 +468,14 @@ impl Node {
                                     last_log_term: self.election_term - 1,
                                 });
                                 let response = client.vote_me(request).await;
-                                let _ =
-                                    result_sender.send(response.unwrap().get_ref().vote_granted);
+                                match response {
+                                    Ok(res) => {
+                                        let _ = result_sender.send(res.get_ref().vote_granted);
+                                    }
+                                    Err(_) => {
+                                        let _ = result_sender.send(false);
+                                    }
+                                }
                             }
                             Err(_) => {
                                 let _ = result_sender.send(false);
@@ -535,6 +556,15 @@ impl MyActorHandle {
     pub async fn init(&self) {
         let (send, recv) = oneshot::channel();
         let msg = Command::Init {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+
+    pub async fn reinit(&self) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::ReInit {
             result_sender: send,
         };
         let _ = self.sender.send(msg).await;
@@ -796,6 +826,7 @@ impl RaftService for MyRaftService {
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendReply>, Status> {
+        println!("dapat entry wohooo");
         // TODO: INI JUGA HARUS FIX SUCCESS HARDCODED JADI TRUE
         let request_raw = request.get_ref();
         if self.handler.get_term().await > request_raw.term {
@@ -833,6 +864,7 @@ impl RaftService for MyRaftService {
     }
 
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
+        let _ = self.tx.send(1);
         let request_raw = request.get_ref();
         println!("dapet vote me niii: {:?}", request_raw);
 
@@ -859,7 +891,7 @@ impl RaftService for MyRaftService {
 
         if (check_voted_for && check_is_up_to_date) || check_is_myself {
             self.handler.set_term(request_raw.term).await;
-            self.handler.set_voted_for(request_raw.candidate_id).await;
+            // self.handler.set_voted_for(request_raw.candidate_id).await;
         }
         println!("debug6");
 
@@ -936,6 +968,8 @@ async fn sender(
         actor_handler.init().await;
     }
     loop {
+        println!("looping time!");
+        println!("my state isssss : {:?}", actor_handler.get_type().await);
         match actor_handler.get_type().await {
             NodeType::LEADER => {
                 match timeout(Duration::from_millis(1000), rx.changed()).await {
@@ -969,7 +1003,12 @@ async fn sender(
                 }
             }
             NodeType::FOLLOWER => {
-                match timeout(Duration::from_millis(5000), rx.changed()).await {
+                match timeout(
+                    Duration::from_millis(random_range(4500..5000)),
+                    rx.changed(),
+                )
+                .await
+                {
                     // TODO: KALAU TIMEOUT JADI CANDIDATEEE
                     Ok(_) => println!("not time out yayyy"),
                     Err(_) => {
@@ -983,8 +1022,10 @@ async fn sender(
                 actor_handler.prepare_vote().await;
                 actor_handler.sync_cluster().await;
                 let mut task_one =
-                    async || match timeout(Duration::from_millis(1234567), rx.changed()).await {
-                        Ok(_) => {}
+                    async || match timeout(Duration::from_millis(4000), rx.changed()).await {
+                        Ok(_) => {
+                            println! {"kena speed diff-----------"}
+                        }
                         Err(_) => {
                             println!("damn vote time out, starting new one...");
                         }
@@ -1005,15 +1046,20 @@ async fn sender(
                     //         println!("gey")
                     //     }));
                     // }
+
+                    let my_cluster = actor_handler.get_address().await.cluster_idx;
                     let threads: Vec<_> = (0..actor_handler.get_cluster_count().await)
                         .map(|i| {
                             let new_handler = actor_handler.clone();
-                            println!("muncul ok nih dari threadaldkfj: {:?}", i);
-                            tokio::spawn(async move {
-                                if new_handler.send_vote(i).await {
-                                    new_handler.inc_ctr().await
-                                }
-                            })
+                            if my_cluster == i {
+                                tokio::spawn(async move {})
+                            } else {
+                                tokio::spawn(async move {
+                                    if new_handler.send_vote(i).await {
+                                        new_handler.inc_ctr().await
+                                    }
+                                })
+                            }
                         })
                         .collect();
                     println!("lewat sini ga?");
@@ -1022,9 +1068,11 @@ async fn sender(
                         let _ = handle.await.unwrap();
                     }
                     println!("lewat sini ga2?");
-                    if actor_handler.get_ctr().await > (actor_handler.get_cluster_count().await / 2)
+                    if actor_handler.get_ctr().await + 1
+                        > (actor_handler.get_cluster_count().await / 2)
                     {
                         actor_handler.change_type(NodeType::LEADER).await;
+                        actor_handler.reinit().await;
                     }
                     println!("lewat sini ga3?");
                 };
