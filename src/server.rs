@@ -5,13 +5,10 @@ use raft_service::{
     AppendReply, AppendRequest, ClientReply, ClientRequest, MembershipReply, MembershipRequest,
     VoteReply, VoteRequest,
 };
-use rand::{random_range, Rng};
+use rand::random_range;
 use std::collections::HashMap;
 use std::env;
-use std::process::exit;
-use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::Barrier;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tokio::time::{sleep, Duration};
@@ -120,17 +117,10 @@ pub enum Command {
     InitAsLeader {
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
-    // SendMembership,
-    // GetMembership,
     SendEntries {
         index: i32,
         result_sender: oneshot::Sender<bool>,
     },
-    // GetEntries,
-    // CheckTerm,
-    // SendVoteReq,
-    // GetVoteReq,
-    // Execute,
     GetAddress {
         result_sender: oneshot::Sender<Address>,
     },
@@ -209,6 +199,19 @@ pub enum Command {
     ReInit {
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
+	SetCommitIndex {
+		index: i32,
+		result_sender: oneshot::Sender<Result<(), ()>>,
+	},
+	GetCommitIndex {
+		result_sender: oneshot::Sender<i32>,
+	},
+	ApplyCommittedEntries {
+		result_sender: oneshot::Sender<Result<(), ()>>,
+	},
+	AdvanceCommit {
+		result_sender: oneshot::Sender<Result<(), ()>>,
+	},
 }
 
 pub struct Node {
@@ -546,6 +549,58 @@ impl Node {
                 self.cluster_leader_addr = address;
                 let _ = result_sender.send(Ok(()));
             }
+			Command::SetCommitIndex { index, result_sender } => {
+				self.commit_index = index;
+				let _ = result_sender.send(Ok(()));
+			}
+			Command::GetCommitIndex { result_sender } => {
+				let _ = result_sender.send(self.commit_index);
+			}
+			Command::ApplyCommittedEntries { result_sender } => {
+				for i in (self.last_applied + 1)..=self.commit_index {
+					if let Some(log) = self.log.get(i as usize) {
+						match log.log_type {
+							LogType::PING => {
+								// TODO
+							}
+							LogType::GET => {
+								// TODO
+							}
+							LogType::SET => {
+								// TODO
+							}
+							LogType::APPEND => {
+								// TODO
+							}
+							LogType::DEL => {
+								// TODO
+							}
+							LogType::STRLEN => {
+								// TODO
+							}
+						}
+					}
+					self.last_applied = i;
+				}
+				let _ = result_sender.send(Ok(()));
+			}
+			Command::AdvanceCommit { result_sender } => {
+				// 50% + 1, match_index[i] >= n &  log[n].term == currentTerm
+				let mut n = self.commit_index + 1;
+				while n < self.log.len() as i32 {
+					let mut count = 1;
+					for idx in self.match_index.clone() {
+						if idx >= n {
+							count += 1;
+						}
+					}
+					if count > self.cluster_addr_list.len() / 2 && self.log[n as usize].term == self.election_term {
+						self.commit_index = n;
+					}
+					n += 1;
+				}
+				let _ = result_sender.send(Ok(()));
+			}
         }
     }
 }
@@ -802,6 +857,39 @@ impl MyActorHandle {
         let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
+	pub async fn set_commit_index(&self, index: i32) {
+		let (send, recv) = oneshot::channel();
+		let msg = Command::SetCommitIndex {
+			index,
+			result_sender: send,
+		};
+		let _ = self.sender.send(msg).await;
+		let _ = recv.await.expect("Actor task has been killed");
+	}
+	pub async fn get_commit_index(&self) -> i32 {
+		let (send, recv) = oneshot::channel();
+		let msg = Command::GetCommitIndex {
+			result_sender: send,
+		};
+		let _ = self.sender.send(msg).await;
+		recv.await.expect("Actor task has been killed")
+	}
+	pub async fn apply_committed_entries(&self) {
+		let (send, recv) = oneshot::channel();
+		let msg = Command::ApplyCommittedEntries {
+			result_sender: send,
+		};
+		let _ = self.sender.send(msg).await;
+		let _ = recv.await.expect("Actor task has been killed");
+	}
+	pub async fn advance_commit_index(&self) {
+		let (send, recv) = oneshot::channel();
+		let msg = Command::AdvanceCommit {
+			result_sender: send,
+		};
+		let _ = self.sender.send(msg).await;
+		let _ = recv.await.expect("Actor task has been killed");
+	}
 }
 
 // STRUCT IMPLEMENTATION
