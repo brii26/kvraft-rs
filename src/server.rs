@@ -530,8 +530,12 @@ impl Node {
                 cluster_idx,
                 result_sender,
             } => {
-                let address = self.cluster_addr_list[cluster_idx as usize].clone();
-                self.voted_for = Some(address);
+				if cluster_idx == -1 {
+					self.voted_for = None;
+				} else {
+					let address = self.cluster_addr_list[cluster_idx as usize].clone();
+					self.voted_for = Some(address);
+				}
                 let _ = result_sender.send(Ok(()));
             }
             Command::SetLeader {
@@ -890,40 +894,53 @@ impl RaftService for MyRaftService {
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
         let _ = self.tx.send(1);
         let request_raw = request.get_ref();
+		let current_term = self.handler.get_term().await;
+		let voted_for = self.handler.get_voted_for().await;
+		let candidate_term = request_raw.term;
+		let current_log = self.handler.get_log().await;
+		let candidate_id = request_raw.candidate_id;
+
+		// Candidate term harus lebih gede dari current term
+		if candidate_term < current_term {
+			return Ok(Response::new(VoteReply {
+				term: current_term,
+				vote_granted: false,
+			}))
+		} else if candidate_term > current_term { 
+			self.handler.set_term(candidate_term).await;
+			self.handler.set_voted_for(-1).await;
+		}
+
         println!("dapet vote me niii: {:?}", request_raw);
-
         println!("cek: {:?}", self.handler);
-
         println!(
             "my cluster idx: {}",
             self.handler.get_address().await.cluster_idx
         );
 
-        let check_is_myself =
-            request_raw.candidate_id == self.handler.get_address().await.cluster_idx;
-        println!("debug3");
+		// voted_for harus null / candidate yg sama
+        let voted_for_ok = voted_for.is_none() || voted_for.as_ref().unwrap().cluster_idx == candidate_id;
 
-        let check_is_up_to_date = check_up_to_date(
-            self.handler.get_log().await,
+		// Cek candiidate log harus up to date <= 
+        let log_up_to_date = check_up_to_date(
+            current_log,
             request_raw.last_log_index,
             request_raw.last_log_term,
         );
-        println!("debug4");
 
-        let check_voted_for = self.handler.get_term().await <= request_raw.term;
-        println!("debug5");
+		// Cek myself, kirim ke diri sendiri juga soalnya voting
+        let check_is_myself = request_raw.candidate_id == self.handler.get_address().await.cluster_idx;
 
-        if (check_voted_for && check_is_up_to_date) || check_is_myself {
-            self.handler.set_term(request_raw.term).await;
-            // self.handler.set_voted_for(request_raw.candidate_id).await;
+        if (voted_for_ok && log_up_to_date) || check_is_myself {
+            self.handler.set_voted_for(request_raw.candidate_id).await;
         }
-        println!("debug6");
 
         let reply = VoteReply {
             term: self.handler.get_term().await,
-            vote_granted: (check_voted_for && check_is_up_to_date) || check_is_myself,
+            vote_granted: (voted_for_ok && log_up_to_date) || check_is_myself,
         };
 
+		// Respond
         println!("niii replynyaa: {:?}", reply);
         Ok(Response::new(reply))
     }
