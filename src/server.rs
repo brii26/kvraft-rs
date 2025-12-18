@@ -22,7 +22,7 @@ pub mod raft_service {
 
 // STRUCT
 #[derive(PartialEq, Clone)]
-enum LogType {
+pub enum LogType {
     PING,
     GET,
     SET,
@@ -138,10 +138,6 @@ pub enum Command {
         ip: String,
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
-    ChangeEntries {
-        entries: Vec<Entries>,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
     UpdateConverted {
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
@@ -199,19 +195,29 @@ pub enum Command {
     ReInit {
         result_sender: oneshot::Sender<Result<(), ()>>,
     },
-	SetCommitIndex {
-		index: i32,
-		result_sender: oneshot::Sender<Result<(), ()>>,
-	},
-	GetCommitIndex {
-		result_sender: oneshot::Sender<i32>,
-	},
-	ApplyCommittedEntries {
-		result_sender: oneshot::Sender<Result<(), ()>>,
-	},
-	AdvanceCommit {
-		result_sender: oneshot::Sender<Result<(), ()>>,
-	},
+    SetCommitIndex {
+        index: i32,
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
+    GetCommitIndex {
+        result_sender: oneshot::Sender<i32>,
+    },
+    ApplyCommittedEntries {
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
+    AdvanceCommit {
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
+    PushLog {
+        log_type: LogType,
+        key: String,
+        val: String,
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
+    GetVal {
+        key: String,
+        result_sender: oneshot::Sender<Result<String, ()>>,
+    },
 }
 
 pub struct Node {
@@ -228,7 +234,6 @@ pub struct Node {
     last_applied: i32,               // Highes Log Entry Index
     next_index: Vec<i32>,            // Expected Next Index Log
     match_index: Vec<i32>,           // ndex of highest log entry known to be replicated on server
-    entries_to_send: Vec<Entries>,
     converted: Vec<raft_service::Address>,
     ok_response: i32,
 }
@@ -258,10 +263,18 @@ impl Node {
             last_applied: 0,
             next_index: Vec::new(),
             match_index: Vec::new(),
-            entries_to_send: Vec::new(),
             converted: Vec::new(),
             ok_response: 0,
         }
+    }
+
+    fn build_entries(&self, index: i32) -> Vec<Entries> {
+        let diff = self.log.len() as i32 - self.next_index[index as usize];
+        let mut entries = Vec::<Entries>::new();
+        for i in self.log.len() - diff as usize..self.log.len() {
+            entries.push(Entries::create_from_log(self.log[i].clone()));
+        }
+        entries
     }
 
     async fn handle_command(&mut self, msg: Command) {
@@ -314,6 +327,8 @@ impl Node {
                 index,
             } => match self.cluster_addr_list.get(index as usize) {
                 Some(x) => {
+                    self.next_index[index as usize] = self.match_index[index as usize] + 1;
+
                     // print!(
                     //     "leader's cluster index: {:?}",
                     //     self.cluster_leader_addr.cluster_idx
@@ -323,38 +338,88 @@ impl Node {
                     } else {
                         match self.log.last() {
                             Some(lastlog) => {
-                                let mut client = RaftServiceClient::connect(x.to_string())
-                                    .await
-                                    .expect("cannot find ip addr");
-                                let request = tonic::Request::new(AppendRequest {
-                                    term: self.election_term,
-                                    leader_id: self.address.cluster_idx,
-                                    prev_log_index: self.log.len() as i32 - 1,
-                                    prev_log_term: lastlog.term,
-                                    leader_commit: self.commit_index,
-                                    entries: self.entries_to_send.clone(),
-                                    cluster_addr_list: self.converted.clone(),
-                                });
-                                let response = client.append_entries(request).await;
-                                let _ = result_sender.send(response.unwrap().get_ref().success);
+                                let conn = RaftServiceClient::connect(x.to_string()).await;
+                                match conn {
+                                    Ok(mut client) => {
+                                        let mut result_bool: bool = false;
+                                        // temporary solution with = here, if something goes out of
+                                        // bound probably is from here
+                                        for _ in (0..=self.log.len()).rev() {
+                                            let request = tonic::Request::new(AppendRequest {
+                                                term: self.election_term,
+                                                leader_id: self.address.cluster_idx,
+                                                prev_log_index: self.log.len() as i32 - 1,
+                                                prev_log_term: lastlog.term,
+                                                leader_commit: self.commit_index,
+                                                entries: self.build_entries(index),
+                                                cluster_addr_list: self.converted.clone(),
+                                            });
+                                            let response = client.append_entries(request).await;
+                                            match response {
+                                                Ok(res) => {
+                                                    if res.get_ref().success {
+                                                        result_bool = true;
+                                                        self.match_index[index as usize] =
+                                                            self.log.len() as i32 - 1;
+                                                        self.next_index[index as usize] =
+                                                            self.match_index[index as usize] + 1;
+                                                        break;
+                                                    } else {
+                                                        result_bool = false;
+                                                        self.next_index[index as usize] -= 1;
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    result_bool = false;
+                                                }
+                                            }
+                                        }
+                                        let _ = result_sender.send(result_bool);
+                                    }
+                                    Err(_) => {
+                                        let _ = result_sender.send(false);
+                                    }
+                                }
                             }
                             None => {
                                 let conn = RaftServiceClient::connect(x.to_string()).await;
 
                                 match conn {
                                     Ok(mut client) => {
-                                        let request = tonic::Request::new(AppendRequest {
-                                            term: self.election_term,
-                                            leader_id: self.cluster_leader_addr.cluster_idx,
-                                            prev_log_index: self.log.len() as i32 - 1,
-                                            prev_log_term: -1,
-                                            leader_commit: self.commit_index,
-                                            entries: self.entries_to_send.clone(),
-                                            cluster_addr_list: self.converted.clone(),
-                                        });
-                                        let response = client.append_entries(request).await;
-                                        let _ =
-                                            result_sender.send(response.unwrap().get_ref().success);
+                                        let mut result_bool: bool = false;
+                                        // temporary solution with = here, if something goes out of
+                                        // bound probably is from here
+                                        for _ in (0..=self.log.len()).rev() {
+                                            let request = tonic::Request::new(AppendRequest {
+                                                term: self.election_term,
+                                                leader_id: self.address.cluster_idx,
+                                                prev_log_index: self.log.len() as i32 - 1,
+                                                prev_log_term: -1,
+                                                leader_commit: self.commit_index,
+                                                entries: self.build_entries(index),
+                                                cluster_addr_list: self.converted.clone(),
+                                            });
+                                            let response = client.append_entries(request).await;
+                                            match response {
+                                                Ok(res) => {
+                                                    if res.get_ref().success {
+                                                        result_bool = true;
+                                                        self.match_index[index as usize] =
+                                                            self.log.len() as i32 - 1;
+                                                        self.next_index[index as usize] =
+                                                            self.match_index[index as usize] + 1;
+                                                        break;
+                                                    } else {
+                                                        result_bool = false;
+                                                        self.next_index[index as usize] -= 1;
+                                                    }
+                                                }
+                                                Err(_) => {
+                                                    result_bool = false;
+                                                }
+                                            }
+                                        }
+                                        let _ = result_sender.send(result_bool);
                                     }
                                     Err(_) => {
                                         let _ = result_sender.send(false);
@@ -392,13 +457,6 @@ impl Node {
             } => {
                 self.cluster_addr_list.push(address);
                 println!("Add membership is successful");
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::ChangeEntries {
-                entries,
-                result_sender,
-            } => {
-                self.entries_to_send = entries;
                 let _ = result_sender.send(Ok(()));
             }
             Command::UpdateConverted { result_sender } => {
@@ -494,10 +552,6 @@ impl Node {
             },
             Command::SyncCluster { result_sender } => {
                 for i in 0..self.cluster_addr_list.len() {
-                    // println!(
-                    //     "bool: {:?}",
-                    //     self.cluster_addr_list[i] == self.cluster_leader_addr
-                    // );
                     self.cluster_addr_list[i].cluster_idx = i as i32;
                     if self.cluster_addr_list[i] == self.address {
                         self.address.cluster_idx = i as i32;
@@ -505,8 +559,13 @@ impl Node {
                     if self.cluster_addr_list[i] == self.cluster_leader_addr {
                         self.cluster_leader_addr.cluster_idx = i as i32;
                     }
+                    if self.match_index.len() <= i {
+                        self.match_index.push(-1);
+                    }
+                    if self.next_index.len() <= i {
+                        self.next_index.push(0);
+                    }
                 }
-                // println!("{:?}", self.cluster_addr_list);
                 let _ = result_sender.send(Ok(()));
             }
             Command::ChangeType {
@@ -533,12 +592,12 @@ impl Node {
                 cluster_idx,
                 result_sender,
             } => {
-				if cluster_idx == -1 {
-					self.voted_for = None;
-				} else {
-					let address = self.cluster_addr_list[cluster_idx as usize].clone();
-					self.voted_for = Some(address);
-				}
+                if cluster_idx == -1 {
+                    self.voted_for = None;
+                } else {
+                    let address = self.cluster_addr_list[cluster_idx as usize].clone();
+                    self.voted_for = Some(address);
+                }
                 let _ = result_sender.send(Ok(()));
             }
             Command::SetLeader {
@@ -549,58 +608,85 @@ impl Node {
                 self.cluster_leader_addr = address;
                 let _ = result_sender.send(Ok(()));
             }
-			Command::SetCommitIndex { index, result_sender } => {
-				self.commit_index = index;
-				let _ = result_sender.send(Ok(()));
-			}
-			Command::GetCommitIndex { result_sender } => {
-				let _ = result_sender.send(self.commit_index);
-			}
-			Command::ApplyCommittedEntries { result_sender } => {
-				for i in (self.last_applied + 1)..=self.commit_index {
-					if let Some(log) = self.log.get(i as usize) {
-						match log.log_type {
-							LogType::PING => {
-								// TODO
-							}
-							LogType::GET => {
-								// TODO
-							}
-							LogType::SET => {
-								// TODO
-							}
-							LogType::APPEND => {
-								// TODO
-							}
-							LogType::DEL => {
-								// TODO
-							}
-							LogType::STRLEN => {
-								// TODO
-							}
-						}
-					}
-					self.last_applied = i;
-				}
-				let _ = result_sender.send(Ok(()));
-			}
-			Command::AdvanceCommit { result_sender } => {
-				// 50% + 1, match_index[i] >= n &  log[n].term == currentTerm
-				let mut n = self.commit_index + 1;
-				while n < self.log.len() as i32 {
-					let mut count = 1;
-					for idx in self.match_index.clone() {
-						if idx >= n {
-							count += 1;
-						}
-					}
-					if count > self.cluster_addr_list.len() / 2 && self.log[n as usize].term == self.election_term {
-						self.commit_index = n;
-					}
-					n += 1;
-				}
-				let _ = result_sender.send(Ok(()));
-			}
+            Command::SetCommitIndex {
+                index,
+                result_sender,
+            } => {
+                self.commit_index = index;
+                let _ = result_sender.send(Ok(()));
+            }
+            Command::GetCommitIndex { result_sender } => {
+                let _ = result_sender.send(self.commit_index);
+            }
+            Command::ApplyCommittedEntries { result_sender } => {
+                for i in (self.last_applied + 1)..=self.commit_index {
+                    if let Some(log) = self.log.get(i as usize) {
+                        match log.log_type {
+                            LogType::PING => {
+                                // TODO
+                            }
+                            LogType::GET => {
+                                // TODO
+                            }
+                            LogType::SET => {
+                                // TODO
+                            }
+                            LogType::APPEND => {
+                                // TODO
+                            }
+                            LogType::DEL => {
+                                // TODO
+                            }
+                            LogType::STRLEN => {
+                                // TODO
+                            }
+                        }
+                    }
+                    self.last_applied = i;
+                }
+                let _ = result_sender.send(Ok(()));
+            }
+            Command::AdvanceCommit { result_sender } => {
+                // 50% + 1, match_index[i] >= n &  log[n].term == currentTerm
+                let mut n = self.commit_index + 1;
+                while n < self.log.len() as i32 {
+                    let mut count = 1;
+                    for idx in self.match_index.clone() {
+                        if idx >= n {
+                            count += 1;
+                        }
+                    }
+                    if count > self.cluster_addr_list.len() / 2
+                        && self.log[n as usize].term == self.election_term
+                    {
+                        self.commit_index = n;
+                    }
+                    n += 1;
+                }
+                let _ = result_sender.send(Ok(()));
+            }
+            Command::PushLog {
+                log_type,
+                key,
+                val,
+                result_sender,
+            } => {
+                self.log.push(Log {
+                    log_type,
+                    key,
+                    val,
+                    term: self.election_term,
+                });
+                let _ = result_sender.send(Ok(()));
+            }
+            Command::GetVal { key, result_sender } => match self.data.get(&key) {
+                Some(val) => {
+                    let _ = result_sender.send(Ok(val.to_string()));
+                }
+                None => {
+                    let _ = result_sender.send(Err(()));
+                }
+            },
         }
     }
 }
@@ -710,16 +796,6 @@ impl MyActorHandle {
         };
         let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
-    }
-
-    pub async fn change_entries(&self, entries: Vec<Entries>) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ChangeEntries {
-            entries: entries,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
     }
 
     pub async fn update_converted(&self) {
@@ -857,56 +933,141 @@ impl MyActorHandle {
         let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
-	pub async fn set_commit_index(&self, index: i32) {
-		let (send, recv) = oneshot::channel();
-		let msg = Command::SetCommitIndex {
-			index,
-			result_sender: send,
-		};
-		let _ = self.sender.send(msg).await;
-		let _ = recv.await.expect("Actor task has been killed");
-	}
-	pub async fn get_commit_index(&self) -> i32 {
-		let (send, recv) = oneshot::channel();
-		let msg = Command::GetCommitIndex {
-			result_sender: send,
-		};
-		let _ = self.sender.send(msg).await;
-		recv.await.expect("Actor task has been killed")
-	}
-	pub async fn apply_committed_entries(&self) {
-		let (send, recv) = oneshot::channel();
-		let msg = Command::ApplyCommittedEntries {
-			result_sender: send,
-		};
-		let _ = self.sender.send(msg).await;
-		let _ = recv.await.expect("Actor task has been killed");
-	}
-	pub async fn advance_commit_index(&self) {
-		let (send, recv) = oneshot::channel();
-		let msg = Command::AdvanceCommit {
-			result_sender: send,
-		};
-		let _ = self.sender.send(msg).await;
-		let _ = recv.await.expect("Actor task has been killed");
-	}
+    pub async fn set_commit_index(&self, index: i32) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::SetCommitIndex {
+            index,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+    pub async fn get_commit_index(&self) -> i32 {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::GetCommitIndex {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
+    pub async fn apply_committed_entries(&self) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::ApplyCommittedEntries {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+    pub async fn advance_commit_index(&self) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::AdvanceCommit {
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+    pub async fn push_log(&self, log_type: LogType, key: String, val: String) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::PushLog {
+            log_type,
+            key,
+            val,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
+    pub async fn get_val(&self, key: String) -> Result<String, ()> {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::GetVal {
+            key,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        recv.await.expect("Actor task has been killed")
+    }
 }
 
 // STRUCT IMPLEMENTATION
-impl LogType {
-    fn ping() {}
-    fn get() {}
-    fn set() {}
-    fn append() {}
-    fn del() {}
-    fn strlen() {}
+// impl LogType {
+//     fn ping() {}
+//     fn get() {}
+//     fn set() {}
+//     fn append() {}
+//     fn del() {}
+//     fn strlen() {}
+// }
+
+impl raft_service::Entries {
+    pub fn create_from_log(log: Log) -> Self {
+        match log.log_type {
+            LogType::SET => {
+                return Entries {
+                    is_set: true,
+                    is_del: false,
+                    is_append: false,
+                    key: log.key,
+                    value: log.val,
+                }
+            }
+            LogType::APPEND => {
+                return Entries {
+                    is_set: false,
+                    is_del: false,
+                    is_append: true,
+                    key: log.key,
+                    value: log.val,
+                }
+            }
+            LogType::DEL => {
+                return Entries {
+                    is_set: false,
+                    is_del: true,
+                    is_append: false,
+                    key: log.key,
+                    value: log.val,
+                }
+            }
+            _default => {
+                return Entries {
+                    is_set: false,
+                    is_del: false,
+                    is_append: false,
+                    key: log.key,
+                    value: log.val,
+                }
+            }
+        }
+    }
 }
 
 impl Log {
-    // fn createLog(&data : String) {
-    // 	let new_log : Log = serde_json::from_str(&data)?;
-    // 	return new_log;
-    // }
+    pub fn create_from_entries(entries: Entries, term: i32) -> Self {
+        if entries.is_set {
+            return Log {
+                log_type: LogType::SET,
+                key: entries.key,
+                val: entries.value,
+                term,
+            };
+        }
+        if entries.is_append {
+            return Log {
+                log_type: LogType::APPEND,
+                key: entries.key,
+                val: entries.value,
+                term,
+            };
+        } else {
+            // asumsi gamungkin type lain
+            return Log {
+                log_type: LogType::DEL,
+                key: entries.key,
+                val: entries.value,
+                term,
+            };
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -925,14 +1086,63 @@ impl RaftService for MyRaftService {
         request: Request<ClientRequest>,
     ) -> Result<Response<ClientReply>, Status> {
         // println!("Got a request: {:?}", request);
-        let reply = ClientReply {
-            message: format!("Hello {}!", request.into_inner().name),
-        };
+        //
 
-        sleep(Duration::from_millis(100)).await;
         let _ = self.tx.send(1);
 
-        Ok(Response::new(reply))
+        match request.get_ref().r#type {
+            1 => {
+                return Ok(Response::new(ClientReply {
+                    message: "PONG".to_string(),
+                }))
+            }
+            2 => match &request.get_ref().key {
+                Some(key) => match self.handler.get_val(key.to_string()).await {
+                    Ok(msg) => {
+                        return Ok(Response::new(ClientReply { message: msg }));
+                    }
+                    Err(_) => return Err(Status::not_found("Key not found")),
+                },
+                None => return Err(Status::invalid_argument("Key required")),
+            },
+            3 => match (&request.get_ref().key, &request.get_ref().val) {
+                (Some(key), Some(val)) => {
+                    self.handler
+                        .push_log(LogType::SET, key.to_string(), val.to_string())
+                        .await;
+                    send_entries(self.handler.clone()).await;
+                    // ini bisa jadi error ga ya
+                    return Ok(Response::new(ClientReply {
+                        message: "Success".to_string(),
+                    }));
+                }
+                (None, None) | (Some(_), None) | (None, Some(_)) => {
+                    return Err(Status::invalid_argument("Key and Val required"))
+                }
+            },
+            4 => {
+                return Ok(Response::new(ClientReply {
+                    message: "PONG".to_string(),
+                }))
+            }
+            5 => {
+                return Ok(Response::new(ClientReply {
+                    message: "PONG".to_string(),
+                }))
+            }
+            6 => {
+                return Ok(Response::new(ClientReply {
+                    message: "PONG".to_string(),
+                }))
+            }
+            7 => {
+                return Ok(Response::new(ClientReply {
+                    message: "PONG".to_string(),
+                }))
+            }
+
+            _default => Err(Status::unimplemented("Request type not implemented")),
+        }
     }
 
     async fn append_entries(
@@ -982,22 +1192,22 @@ impl RaftService for MyRaftService {
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
         let _ = self.tx.send(1);
         let request_raw = request.get_ref();
-		let current_term = self.handler.get_term().await;
-		let voted_for = self.handler.get_voted_for().await;
-		let candidate_term = request_raw.term;
-		let current_log = self.handler.get_log().await;
-		let candidate_id = request_raw.candidate_id;
+        let current_term = self.handler.get_term().await;
+        let voted_for = self.handler.get_voted_for().await;
+        let candidate_term = request_raw.term;
+        let current_log = self.handler.get_log().await;
+        let candidate_id = request_raw.candidate_id;
 
-		// Candidate term harus lebih gede dari current term
-		if candidate_term < current_term {
-			return Ok(Response::new(VoteReply {
-				term: current_term,
-				vote_granted: false,
-			}))
-		} else if candidate_term > current_term { 
-			self.handler.set_term(candidate_term).await;
-			self.handler.set_voted_for(-1).await;
-		}
+        // Candidate term harus lebih gede dari current term
+        if candidate_term < current_term {
+            return Ok(Response::new(VoteReply {
+                term: current_term,
+                vote_granted: false,
+            }));
+        } else if candidate_term > current_term {
+            self.handler.set_term(candidate_term).await;
+            self.handler.set_voted_for(-1).await;
+        }
 
         println!("dapet vote me niii: {:?}", request_raw);
         println!("cek: {:?}", self.handler);
@@ -1006,18 +1216,20 @@ impl RaftService for MyRaftService {
             self.handler.get_address().await.cluster_idx
         );
 
-		// voted_for harus null / candidate yg sama
-        let voted_for_ok = voted_for.is_none() || voted_for.as_ref().unwrap().cluster_idx == candidate_id;
+        // voted_for harus null / candidate yg sama
+        let voted_for_ok =
+            voted_for.is_none() || voted_for.as_ref().unwrap().cluster_idx == candidate_id;
 
-		// Cek candiidate log harus up to date <= 
+        // Cek candiidate log harus up to date <=
         let log_up_to_date = check_up_to_date(
             current_log,
             request_raw.last_log_index,
             request_raw.last_log_term,
         );
 
-		// Cek myself, kirim ke diri sendiri juga soalnya voting
-        let check_is_myself = request_raw.candidate_id == self.handler.get_address().await.cluster_idx;
+        // Cek myself, kirim ke diri sendiri juga soalnya voting
+        let check_is_myself =
+            request_raw.candidate_id == self.handler.get_address().await.cluster_idx;
 
         if (voted_for_ok && log_up_to_date) || check_is_myself {
             self.handler.set_voted_for(request_raw.candidate_id).await;
@@ -1028,7 +1240,7 @@ impl RaftService for MyRaftService {
             vote_granted: (voted_for_ok && log_up_to_date) || check_is_myself,
         };
 
-		// Respond
+        // Respond
         println!("niii replynyaa: {:?}", reply);
         Ok(Response::new(reply))
     }
@@ -1087,6 +1299,28 @@ async fn receiver(
     Ok(())
 }
 
+async fn send_entries(actor_handler: MyActorHandle) {
+    actor_handler.update_converted().await;
+    actor_handler.sync_cluster().await;
+    actor_handler.reset_ctr().await;
+
+    let threads: Vec<_> = (0..actor_handler.get_cluster_count().await)
+        .map(|i| {
+            let new_handler = actor_handler.clone();
+            tokio::spawn(async move {
+                if new_handler.send_entries(i).await {
+                    new_handler.inc_ctr().await
+                }
+            })
+        })
+        .collect();
+    // TODO: handle kalau udah mayoritas commmit, baru kita commit
+    for handle in threads {
+        let _ = handle.await.unwrap();
+    }
+    println!("Success responses: {}", actor_handler.get_ctr().await);
+}
+
 async fn sender(
     rx: &mut tokio::sync::watch::Receiver<i32>,
     actor_handler: MyActorHandle,
@@ -1100,37 +1334,13 @@ async fn sender(
         println!("looping time!");
         println!("my state isssss : {:?}", actor_handler.get_type().await);
         match actor_handler.get_type().await {
-            NodeType::LEADER => {
-                match timeout(Duration::from_millis(1000), rx.changed()).await {
-                    Ok(_) => println!("this is not supposed to happen btw"),
-                    Err(_) => {
-                        println!("heartbeat time baby!");
-                        actor_handler.change_entries(Vec::new()).await;
-                        actor_handler.update_converted().await;
-                        actor_handler.sync_cluster().await;
-                        actor_handler.reset_ctr().await;
-
-                        let threads: Vec<_> = (0..actor_handler.get_cluster_count().await)
-                            .map(|i| {
-                                // TODO: INI NANTI DI SEND ENTRIES NYA BENERAN HRS HANDLE PEMBUATAN
-                                // ENTRY SAMPAI HANDLE LOG INCONSISTENCY (DENGAN LOOP)
-                                // handle juga kalau termnya kita lebih kecil
-                                let new_handler = actor_handler.clone();
-                                tokio::spawn(async move {
-                                    if new_handler.send_entries(i).await {
-                                        new_handler.inc_ctr().await
-                                    }
-                                })
-                            })
-                            .collect();
-                        // TODO: handle kalau udah mayoritas commmit, baru kita commit
-                        for handle in threads {
-                            let _ = handle.await.unwrap();
-                        }
-                        println!("Success responses: {}", actor_handler.get_ctr().await);
-                    }
+            NodeType::LEADER => match timeout(Duration::from_millis(1000), rx.changed()).await {
+                Ok(_) => println!("uwauwa"),
+                Err(_) => {
+                    println!("heartbeat time baby!");
+                    send_entries(actor_handler.clone()).await;
                 }
-            }
+            },
             NodeType::FOLLOWER => {
                 match timeout(
                     Duration::from_millis(random_range(4500..5000)),

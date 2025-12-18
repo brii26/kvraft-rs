@@ -10,9 +10,22 @@ service RaftService{
 
 
 // Client Entries
+// Client code:
+// 1. ping
+// 2. get <nama-key>
+// 3. set <nama-key> <value>
+// 4. strln <nama-key>
+// 5. del <nama-key>
+// 6. append <nama-key> <value>
+// 7. change <ip-dadr> <port>
 message ClientRequest { 
-	string name = 1; 
+	int32 type = 1;
+  optional string key = 2;
+  optional string val = 3;
+  optional string ip = 4;
+  optional string port = 5;
 }
+
 message ClientReply { 
 	string message = 1; 
 }

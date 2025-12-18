@@ -19,6 +19,7 @@ tokio = { version = "1.0", features = ["macros", "rt-multi-thread","signal"] }
 serde = { version = "1.0.104", features = ["derive"] }
 serde_json = "1.0.48"
 rand = "0.9.2"
+dialoguer = { version = "0.12.0", features = ["editor", "password", "history", "completion"]}
 
 [build-dependencies]
 tonic-prost-build = "*"
