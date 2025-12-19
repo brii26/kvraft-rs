@@ -15,7 +15,13 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
     while let Some(c) = chars.next() {
         match c {
             '"' => {
-                in_quotes = !in_quotes;
+                if in_quotes {
+                    out.push(cur.clone());
+                    cur.clear();
+                    in_quotes = false;
+                } else {
+                    in_quotes = true;
+                }
             }
             '\\' if in_quotes => {
                 if let Some(n) = chars.next() {
@@ -35,9 +41,11 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
     if in_quotes {
         return Err("Unclosed quote (\")".to_string());
     }
+
     if !cur.is_empty() {
         out.push(cur);
     }
+
     Ok(out)
 }
 
