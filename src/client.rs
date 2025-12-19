@@ -115,24 +115,36 @@ fn parse_req_str(req_string: String) -> Result<tonic::Request<ClientRequest>, St
                     "del" => request.get_mut().r#type = 5,
                     "append" => request.get_mut().r#type = 6,
                     "change" => request.get_mut().r#type = 7,
-                    _default => return Err("Unexpected token".to_string()),
+                    _default => return Err("Command not recognized".to_string()),
                 }
 
                 match request.get_ref().r#type {
                     1 => {
                         if len != 1 {
-                            return Err("Unexpected token".to_string());
+                            return Err("Please input ping only".to_string());
                         }
                     }
 
                     2 | 4..6 => {
-                        if len != 2 {
-                            return Err("Unexpected token".to_string());
+                        if len < 2 {
+                            return Err(format!("Please input {} <nama-key>", req_string)); //get, strln, del
+                        } else if len > 2 {
+                            return Err(format!("Too many arguments for {}", req_string));
                         }
                     }
                     3 | 6..8 => {
-                        if len != 3 {
-                            return Err("Unexpected token".to_string());
+                        if len < 3 {
+                            if req_string == "change" {
+                                return Err(format!("Please input {} <ip-address> <port>", req_string)); //change
+                            } else {
+                                return Err(format!("Please input {} <nama-key> <value>", req_string)); //set, append
+                            }
+                        } else if len > 3 {
+                            if req_string == "change" {
+                                return Err(format!("Too many arguments for {}", req_string));
+                            } else {
+                                return Err(format!("Too many arguments for {}", req_string));
+                            }
                         }
                     }
                     _default => {
