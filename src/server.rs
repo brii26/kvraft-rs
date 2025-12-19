@@ -971,7 +971,8 @@ async fn join_cluster(shared: Shared, seed_leader: Addr) {
                 .collect();
 
             st.recompute_cluster_indices();
-            st.is_member = true;
+            st.me.cluster_idx = reply.assigned_id;
+            st.is_member = reply.assigned_id >= 0;
 
             if let Some(ld) = reply.leader {
                 st.leader = Some(Addr {
