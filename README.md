@@ -1,13 +1,13 @@
 # Tugas Besar Sistem Paralel dan Terdistribusi 2025
 
-# [Nama Kelompok] - [Kelas]
+# cudahshyat - k-03
 
 ## Anggota Kelompok
 
 | Nama           | NIM        |
 |----------------|------------|
 |        Brian Ricardo Tamin        |   13523126        |
-|    Boye Ginting            |   NIM 2         |
+|    Boye Mangaratua Ginting            |   13523127         |
 |    Nathanael Rachmat            |   13523142        |
 
 ## Status Fitur
@@ -15,8 +15,8 @@
 
 | Fitur               | Status       |
 |---------------------|--------------|
-| Heartbeat          | blm selesai  |
-| Leader Election    | blm selesai  |
+| Heartbeat          | selesai  |
+| Leader Election    | selesai  |
 | Log Replication    | blm selesai  |
 | Membership Change  | blm selesai  |
 | Unit Testing (bonus)| blm selesai  |

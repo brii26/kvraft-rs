@@ -178,7 +178,7 @@ fn parse_req_str(req_string: String) -> Result<tonic::Request<ClientRequest>, St
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        panic!("Brow aint no way salah input: liat readme pls")
+        panic!("Use command : cargo run --bin client <ip-addr> <port>");
     }
     let ip_addr = &args[1];
     let port = &args[2];
