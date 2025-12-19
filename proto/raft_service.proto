@@ -1,82 +1,28 @@
 syntax = "proto3";
 package raft_service;
 
-service RaftService{
-    rpc Client (ClientRequest) returns (ClientReply);
-	rpc AppendEntries (AppendRequest) returns (AppendReply);
-	rpc VoteMe (VoteRequest) returns (VoteReply);
-	rpc Membership (MembershipRequest) returns (MembershipReply);
+service RaftService {
+  rpc Execute(ExecuteRequest) returns (ExecuteReply);
+  rpc RequestLog(RequestLogRequest) returns (RequestLogReply);
+
+  rpc AppendEntries(AppendRequest) returns (AppendReply);
+  rpc VoteMe(VoteRequest) returns (VoteReply);
+  rpc Membership(MembershipRequest) returns (MembershipReply);
 }
 
+enum CommandType {
+  CMD_UNKNOWN = 0;
 
-// Client Entries
-// Client code:
-// 1. ping
-// 2. get <nama-key>
-// 3. set <nama-key> <value>
-// 4. strln <nama-key>
-// 5. del <nama-key>
-// 6. append <nama-key> <value>
-// 7. change <ip-dadr> <port>
-message ClientRequest { 
-	int32 type = 1;
-  optional string key = 2;
-  optional string val = 3;
-  optional string ip = 4;
-  optional string port = 5;
-}
+  CMD_PING = 1;
+  CMD_GET = 2;
+  CMD_SET = 3;
+  CMD_APPEND = 4;
+  CMD_DEL = 5;
+  CMD_STRLEN = 6;
 
-message ClientReply { 
-	string message = 1; 
-}
+  CMD_REMOVE_MEMBER = 7;
 
-// Append Entries 
-message Entries {
-	bool isSet = 2;
-	bool isDel = 3;
-	bool isAppend = 4;
-	string key = 5;
-	string value = 6;
-  int32 term = 7;
-}
-
-message AppendRequest {
-  int32 term = 1;
-  int32 leaderId = 2;
-  int32 prevLogIndex = 3;
-  int32 prevLogTerm = 4;
-  int32 leaderCommit = 5;
-  repeated Entries entries = 6;
-  repeated Address cluster_addr_list = 7;
-}
-message AppendReply {
-    int32 term = 1;
-    bool success = 2;
-}
-
-// Vote Request
-message VoteRequest {
-	  int32 term = 1;
-	  int32 candidateId = 2;
-	  int32 lastLogIndex = 3;
-	  int32 lastLogTerm = 4;
- }
- message VoteReply {
-	  int32 term = 1;
-    bool voteGranted = 2;
- }
-
-// Append Entries 
-message MembershipRequest {
-	string ipAddr = 1;
-	string port = 2;
-}
-
-message MembershipReply { 
-	string ipAddr  = 1;
-	string port = 2;
-	bool status = 3; // "redirected" -> 0 || "OK" -> 1
-  int32 id = 4;
+  CMD_REQUEST_LOG = 8;
 }
 
 message Address {
@@ -84,3 +30,82 @@ message Address {
   string port = 2;
   int32 cluster_idx = 3;
 }
+
+message ExecuteRequest {
+  CommandType cmd = 1;
+  string key = 2;
+  string value = 3;
+  int32 node_id = 4;
+}
+
+message ExecuteReply {
+  bool ok = 1;
+  string message = 2;
+
+  bool redirect = 3;
+  Address leader = 4;
+}
+
+message RequestLogRequest {}
+
+message LogEntry {
+  CommandType cmd = 1;
+  string key = 2;
+  string value = 3;
+  int32 term = 4;
+}
+
+message RequestLogReply {
+  bool ok = 1;
+
+  bool redirect = 2;
+  Address leader = 3;
+
+  repeated LogEntry log = 4;
+}
+
+message AppendRequest {
+  int32 term = 1;
+  int32 leader_id = 2;
+
+  int32 prev_log_index = 3;
+  int32 prev_log_term = 4;
+
+  int32 leader_commit = 5;
+
+  repeated LogEntry entries = 6;
+
+  repeated Address cluster_config = 7;
+}
+
+message AppendReply {
+  int32 term = 1;
+  bool success = 2;
+}
+
+message VoteRequest {
+  int32 term = 1;
+  int32 candidate_id = 2;
+  int32 last_log_index = 3;
+  int32 last_log_term = 4;
+}
+
+message VoteReply {
+  int32 term = 1;
+  bool vote_granted = 2;
+}
+
+message MembershipRequest {
+  string ip_addr = 1;
+  string port = 2;
+}
+
+message MembershipReply {
+  bool ok = 1;
+
+  Address leader = 2;
+
+  int32 assigned_id = 3;
+  repeated Address cluster_config = 4;
+}
+

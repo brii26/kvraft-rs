@@ -1,1639 +1,1192 @@
-use raft_service::raft_service_client::RaftServiceClient;
-use raft_service::raft_service_server::{RaftService, RaftServiceServer};
-use raft_service::{
-    AppendReply, AppendRequest, ClientReply, ClientRequest, MembershipReply, MembershipRequest,
-    VoteReply, VoteRequest,
-};
-use rand::random_range;
-use std::cmp;
 use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 use tokio::signal;
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::time::timeout;
-use tokio::time::{sleep, Duration};
+use tokio::sync::Mutex;
+use tokio::time::{sleep, Duration, Instant};
 use tonic::{transport::Server, Request, Response, Status};
 
-use crate::raft_service::Entries;
+use raft_service::raft_service_client::RaftServiceClient;
+use raft_service::raft_service_server::{RaftService, RaftServiceServer};
+
+use raft_service::{
+    AppendReply, AppendRequest, CommandType, ExecuteReply, ExecuteRequest, LogEntry,
+    MembershipReply, MembershipRequest, RequestLogReply, RequestLogRequest, VoteReply, VoteRequest,
+};
 
 pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
 
-// STRUCT
-#[derive(PartialEq, Clone, Debug)]
-pub enum LogType {
-    PING,
-    GET,
-    SET,
-    APPEND,
-    DEL,
-    STRLEN,
+#[derive(Clone, Debug, PartialEq)]
+enum Role {
+    Leader,
+    Candidate,
+    Follower,
 }
 
-#[derive(PartialEq, Clone, Debug)]
-pub struct Log {
-    log_type: LogType,
-    key: String,
-    val: String,
-    term: i32,
-}
-
-pub fn check_up_to_date(src: Vec<Log>, lastlogindex: i32, lastlogterm: i32) -> bool {
-    if src.len() == 0 {
-        return true;
-    }
-    let last_log = src[src.len() - 1].clone();
-    if last_log.term > lastlogterm {
-        return false;
-    }
-    if src.len() as i32 - 1 > lastlogindex {
-        return false;
-    }
-    true
-}
-
-#[derive(Clone, PartialEq, Debug)]
-pub enum NodeType {
-    LEADER,
-    CANDIDATE,
-    FOLLOWER,
-}
-
-#[derive(Clone, Debug)]
-pub struct Address {
+#[derive(Clone, Debug, PartialEq)]
+struct Addr {
     ip: String,
     port: String,
     cluster_idx: i32,
 }
 
-impl Address {
-    pub fn to_string(&self) -> String {
-        let mut addr_str = String::from("http://");
-        addr_str.push_str(&self.ip);
-        addr_str.push(':');
-        addr_str.push_str(&self.port);
-        addr_str
+impl Addr {
+    fn uri(&self) -> String {
+        format!("http://{}:{}", self.ip, self.port)
     }
 
-    pub fn to_proto_address(&self) -> raft_service::Address {
+    fn to_proto(&self) -> raft_service::Address {
         raft_service::Address {
             ip: self.ip.clone(),
             port: self.port.clone(),
-            cluster_idx: self.cluster_idx.clone(),
+            cluster_idx: self.cluster_idx,
         }
     }
 
-    pub fn equals_to(&self, other: &Address) -> bool {
-        &self.ip == &other.ip && &self.port == &other.port
-    }
-}
-
-pub fn get_index(list: Vec<Address>, address: Address) -> i32 {
-    list.iter()
-        .position(|n| n.equals_to(&address))
-        .map(|i| i.try_into().unwrap())
-        .unwrap_or(-1)
-}
-
-impl PartialEq for Address {
-    fn eq(&self, other: &Self) -> bool {
+    fn equals_no_idx(&self, other: &Addr) -> bool {
         self.ip == other.ip && self.port == other.port
     }
 }
 
-pub enum Command {
-    Init {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    InitAsLeader {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    SendEntries {
-        index: i32,
-        result_sender: oneshot::Sender<bool>,
-    },
-    GetAddress {
-        result_sender: oneshot::Sender<Address>,
-    },
-    GetType {
-        result_sender: oneshot::Sender<NodeType>,
-    },
-    GetLeader {
-        result_sender: oneshot::Sender<Address>,
-    },
-    AddMember {
-        address: Address,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    ChangeAddress {
-        ip: String,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    UpdateConverted {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    GetTerm {
-        result_sender: oneshot::Sender<i32>,
-    },
-    GetClusterCount {
-        result_sender: oneshot::Sender<i32>,
-    },
-    PrepareVote {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    UpdateCluster {
-        list: Vec<raft_service::Address>,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    ResetCtr {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    IncCtr {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    GetCtr {
-        result_sender: oneshot::Sender<i32>,
-    },
-    SendVote {
-        index: i32,
-        result_sender: oneshot::Sender<bool>,
-    },
-    SyncCluster {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    ChangeType {
-        new_type: NodeType,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    SetTerm {
-        term: i32,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    GetLog {
-        result_sender: oneshot::Sender<Vec<Log>>,
-    },
-    GetVotedFor {
-        result_sender: oneshot::Sender<Option<Address>>,
-    },
-    SetVotedFor {
-        cluster_idx: i32,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    SetLeader {
-        cluster_idx: i32,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    ReInit {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    SetCommitIndex {
-        index: i32,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    GetCommitIndex {
-        result_sender: oneshot::Sender<i32>,
-    },
-    ApplyCommittedEntries {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    AdvanceCommit {
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    PushLog {
-        log_type: LogType,
-        key: String,
-        val: String,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
-    GetVal {
-        key: String,
-        result_sender: oneshot::Sender<Result<String, ()>>,
-    },
-    ChangeLog {
-        new_logs: Vec<Log>,
-        result_sender: oneshot::Sender<Result<(), ()>>,
-    },
+fn cmd_from_i32(v: i32) -> CommandType {
+    CommandType::try_from(v).unwrap_or(CommandType::CmdUnknown)
 }
 
-pub struct Node {
-    receiver: mpsc::Receiver<Command>,
-    address: Address,                // Node Address
-    node_type: NodeType,             // leader, candidate , follower
-    log: Vec<Log>,                   // Stores Logs
-    data: HashMap<String, String>,   // Key value pair data
-    cluster_addr_list: Vec<Address>, // Address List Cluster
-    cluster_leader_addr: Address,    // Current Leader Address
-    election_term: i32,              // Current Election Term
-    voted_for: Option<Address>,      // Voting ID
-    commit_index: i32,               // Last Commit Index
-    last_applied: i32,               // Highes Log Entry Index
-    next_index: Vec<i32>,            // Expected Next Index Log
-    match_index: Vec<i32>,           // ndex of highest log entry known to be replicated on server
-    converted: Vec<raft_service::Address>,
-    ok_response: i32,
+fn last_log_term(log: &[LogEntry]) -> i32 {
+    log.last().map(|e| e.term).unwrap_or(-1)
 }
 
-impl Node {
-    fn new(
-        receiver: mpsc::Receiver<Command>,
-        address: Address,
-        node_type: NodeType,
-        cluster_leader_addr: Address,
-    ) -> Self {
-        let mut final_voted_for: Option<Address> = None;
-        if address == cluster_leader_addr {
-            final_voted_for = Some(address.clone());
-        }
-        Node {
-            receiver,
-            address,
-            node_type,
-            log: Vec::new(),
-            data: HashMap::new(),
-            cluster_addr_list: Vec::new(),
-            cluster_leader_addr,
-            election_term: 0,
-            voted_for: final_voted_for,
-            commit_index: -1,
-            last_applied: -1,
-            next_index: Vec::new(),
-            match_index: Vec::new(),
-            converted: Vec::new(),
-            ok_response: 0,
-        }
-    }
-
-    fn build_entries(&self, index: i32) -> Vec<Entries> {
-        let diff = self.log.len() as i32 - self.next_index[index as usize];
-
-        let mut entries = Vec::<Entries>::new();
-        println!("{0}..{1}", self.log.len() as i32 - diff, self.log.len());
-        for i in self.log.len() as i32 - diff..self.log.len() as i32 {
-            entries.push(Entries::create_from_log(self.log[i as usize].clone()));
-        }
-        entries
-    }
-
-    async fn handle_command(&mut self, msg: Command) {
-        match msg {
-            Command::Init { result_sender } => {
-                loop {
-                    let conn =
-                        RaftServiceClient::connect(self.cluster_leader_addr.to_string()).await;
-                    match conn {
-                        Ok(mut client) => {
-                            let request = tonic::Request::new(MembershipRequest {
-                                ip_addr: (self.address.ip.clone()),
-                                port: (self.address.port.clone()),
-                            });
-                            let mut response = client.membership(request).await;
-                            let status = response.as_mut().unwrap().get_ref().status;
-
-                            if status {
-                                break;
-                            }
-
-                            self.cluster_leader_addr = Address {
-                                ip: response.as_mut().unwrap().get_ref().ip_addr.clone(),
-                                port: response.as_mut().unwrap().get_ref().port.clone(),
-                                cluster_idx: -1,
-                            };
-                        }
-                        Err(_) => {
-                            panic!("Cannot connect to ip address :(");
-                        }
-                    }
-                }
-
-                println!("Init successful");
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::ReInit { result_sender } => {
-                self.cluster_leader_addr = self.address.clone();
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::InitAsLeader { result_sender } => {
-                self.cluster_addr_list.push(self.address.clone());
-                self.election_term = 1;
-                println!("Init as leader successful");
-                let _ = result_sender.send(Ok(()));
-            }
-
-            Command::SendEntries {
-                result_sender,
-                index,
-            } => match self.cluster_addr_list.get(index as usize) {
-                Some(x) => {
-                    self.next_index[index as usize] = self.match_index[index as usize] + 1;
-
-                    // print!(
-                    //     "leader's cluster index: {:?}",
-                    //     self.cluster_leader_addr.cluster_idx
-                    // );
-                    if index == self.cluster_leader_addr.cluster_idx {
-                        let _ = result_sender.send(true);
-                    } else {
-                        // match self.log.last() {
-                        //     Some(lastlog) => {
-                        let conn = RaftServiceClient::connect(x.to_string()).await;
-                        match conn {
-                            Ok(mut client) => {
-                                let mut result_bool: bool = false;
-
-                                let mut prev_log_term = -1;
-                                println!("{}", self.match_index[index as usize]);
-                                if self.log.len() > 0 && self.match_index[index as usize] != -1 {
-                                    prev_log_term =
-                                        self.log[self.match_index[index as usize] as usize].term;
-                                }
-
-                                // temporary solution with = here, if something goes out of
-                                // bound probably is from here
-                                //
-
-                                if self.log.len() == 0 {
-                                    let request = tonic::Request::new(AppendRequest {
-                                        term: self.election_term,
-                                        leader_id: self.address.cluster_idx,
-                                        prev_log_index: self.match_index[index as usize],
-                                        prev_log_term: prev_log_term,
-                                        leader_commit: self.commit_index,
-                                        entries: self.build_entries(index),
-                                        cluster_addr_list: self.converted.clone(),
-                                    });
-                                    let response = client.append_entries(request).await;
-                                    match response {
-                                        Ok(res) => {
-                                            if res.get_ref().success {
-                                                result_bool = true;
-                                                self.match_index[index as usize] =
-                                                    self.log.len() as i32 - 1;
-                                                self.next_index[index as usize] =
-                                                    self.match_index[index as usize] + 1;
-                                                println!(
-                                                    "my matching index: {0} from thread: {1}",
-                                                    self.match_index[index as usize], index
-                                                );
-                                            } else {
-                                                result_bool = false;
-                                                self.next_index[index as usize] -= 1;
-                                            }
-                                        }
-                                        Err(_) => {
-                                            result_bool = false;
-                                        }
-                                    }
-                                } else {
-                                    for _ in (0..self.log.len()).rev() {
-                                        let request = tonic::Request::new(AppendRequest {
-                                            term: self.election_term,
-                                            leader_id: self.address.cluster_idx,
-                                            prev_log_index: self.match_index[index as usize],
-                                            prev_log_term: prev_log_term,
-                                            leader_commit: self.commit_index,
-                                            entries: self.build_entries(index),
-                                            cluster_addr_list: self.converted.clone(),
-                                        });
-                                        let response = client.append_entries(request).await;
-                                        match response {
-                                            Ok(res) => {
-                                                if res.get_ref().success {
-                                                    result_bool = true;
-                                                    self.match_index[index as usize] =
-                                                        self.log.len() as i32 - 1;
-                                                    self.next_index[index as usize] =
-                                                        self.match_index[index as usize] + 1;
-                                                    println!(
-                                                        "my matching index: {0} from thread: {1}",
-                                                        self.match_index[index as usize], index
-                                                    );
-                                                    break;
-                                                } else {
-                                                    result_bool = false;
-                                                    self.next_index[index as usize] -= 1;
-                                                }
-                                            }
-                                            Err(_) => {
-                                                result_bool = false;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                let _ = result_sender.send(result_bool);
-                            }
-                            Err(_) => {
-                                let _ = result_sender.send(false);
-                            }
-                        }
-                    }
-                }
-                None => {
-                    println!("index not found1");
-                    let _ = result_sender.send(true);
-                }
-            },
-
-            Command::GetType { result_sender } => {
-                let _ = result_sender.send(self.node_type.clone());
-            }
-            Command::GetLeader { result_sender } => {
-                let _ = result_sender.send(self.cluster_leader_addr.clone());
-            }
-
-            Command::GetAddress { result_sender } => {
-                let _ = result_sender.send(self.address.clone());
-            }
-            Command::ChangeAddress { ip, result_sender } => {
-                self.address.ip = ip;
-                println!("Change is successful");
-                let _ = result_sender.send(Ok(()));
-            }
-
-            Command::AddMember {
-                address,
-                result_sender,
-            } => {
-                self.cluster_addr_list.push(address);
-                println!("Add membership is successful");
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::UpdateConverted { result_sender } => {
-                self.converted = self
-                    .cluster_addr_list
-                    .iter()
-                    .map(|x| x.to_proto_address())
-                    .collect();
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::GetTerm { result_sender } => {
-                let _ = result_sender.send(self.election_term);
-            }
-            Command::GetClusterCount { result_sender } => {
-                let _ = result_sender.send(self.cluster_addr_list.len() as i32);
-            }
-            Command::PrepareVote { result_sender } => {
-                self.election_term += 1;
-                self.voted_for = Some(self.address.clone());
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::UpdateCluster {
-                list,
-                result_sender,
-            } => {
-                self.cluster_addr_list = list
-                    .iter()
-                    .map(|x| Address {
-                        ip: x.ip.clone(),
-                        port: x.port.clone(),
-                        cluster_idx: x.cluster_idx.clone(),
-                    })
-                    .collect();
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::ResetCtr { result_sender } => {
-                self.ok_response = 0;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::IncCtr { result_sender } => {
-                self.ok_response += 1;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::GetCtr { result_sender } => {
-                let _ = result_sender.send(self.ok_response);
-            }
-            Command::SendVote {
-                index,
-                result_sender,
-            } => match self.cluster_addr_list.get(index as usize) {
-                Some(x) => match self.log.last() {
-                    Some(lastlog) => {
-                        let conn = RaftServiceClient::connect(x.to_string()).await;
-                        match conn {
-                            Ok(mut client) => {
-                                let request = tonic::Request::new(VoteRequest {
-                                    term: self.election_term,
-                                    candidate_id: self.address.cluster_idx,
-                                    last_log_index: self.log.len() as i32 - 1,
-                                    last_log_term: lastlog.term,
-                                });
-                                let response = client.vote_me(request).await;
-                                match response {
-                                    Ok(result) => {
-                                        let _ = result_sender.send(result.get_ref().vote_granted);
-                                    }
-                                    Err(_) => {
-                                        let _ = result_sender.send(false);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let _ = result_sender.send(false);
-                            }
-                        }
-                    }
-                    None => {
-                        let conn = RaftServiceClient::connect(x.to_string()).await;
-                        println!("{:?}", conn);
-                        match conn {
-                            Ok(mut client) => {
-                                let request = tonic::Request::new(VoteRequest {
-                                    term: self.election_term,
-                                    candidate_id: self.address.cluster_idx,
-                                    last_log_index: self.log.len() as i32 - 1,
-                                    last_log_term: self.election_term - 1,
-                                });
-                                let response = client.vote_me(request).await;
-                                match response {
-                                    Ok(res) => {
-                                        let _ = result_sender.send(res.get_ref().vote_granted);
-                                    }
-                                    Err(_) => {
-                                        let _ = result_sender.send(false);
-                                    }
-                                }
-                            }
-                            Err(_) => {
-                                let _ = result_sender.send(false);
-                            }
-                        }
-                    }
-                },
-                None => {}
-            },
-            Command::SyncCluster { result_sender } => {
-                for i in 0..self.cluster_addr_list.len() {
-                    self.cluster_addr_list[i].cluster_idx = i as i32;
-                    if self.cluster_addr_list[i] == self.address {
-                        self.address.cluster_idx = i as i32;
-                    }
-                    if self.cluster_addr_list[i] == self.cluster_leader_addr {
-                        self.cluster_leader_addr.cluster_idx = i as i32;
-                    }
-                    if self.match_index.len() <= i {
-                        self.match_index.push(-1);
-                    }
-                    if self.next_index.len() <= i {
-                        self.next_index.push(0);
-                    }
-                }
-                // println!(
-                //     "syncronize for nextindex: {}",
-                //     self.next_index[self.next_index.len() - 1]
-                // );
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::ChangeType {
-                new_type,
-                result_sender,
-            } => {
-                self.node_type = new_type;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::SetTerm {
-                term,
-                result_sender,
-            } => {
-                self.election_term = term;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::GetLog { result_sender } => {
-                let _ = result_sender.send(self.log.clone());
-            }
-            Command::GetVotedFor { result_sender } => {
-                let _ = result_sender.send(self.voted_for.clone());
-            }
-            Command::SetVotedFor {
-                cluster_idx,
-                result_sender,
-            } => {
-                if cluster_idx == -1 {
-                    self.voted_for = None;
-                } else {
-                    let address = self.cluster_addr_list[cluster_idx as usize].clone();
-                    self.voted_for = Some(address);
-                }
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::SetLeader {
-                cluster_idx,
-                result_sender,
-            } => {
-                let address = self.cluster_addr_list[cluster_idx as usize].clone();
-                self.cluster_leader_addr = address;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::SetCommitIndex {
-                index,
-                result_sender,
-            } => {
-                self.commit_index = index;
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::GetCommitIndex { result_sender } => {
-                let _ = result_sender.send(self.commit_index);
-            }
-            Command::ApplyCommittedEntries { result_sender } => {
-                println!(
-                    "debug apply commit : {0} {1}",
-                    (self.last_applied + 1),
-                    self.commit_index
-                );
-                for i in (self.last_applied + 1)..=self.commit_index {
-                    if let Some(log) = self.log.get(i as usize) {
-                        match log.log_type.clone() {
-                            LogType::SET => {
-                                // TODO
-                                self.data.insert(log.key.clone(), log.val.clone());
-                                match self.data.get(&log.key) {
-                                    Some(val) => {
-                                        println!("berhasil set, key: {0} value: {1}", log.key, val);
-                                    }
-                                    None => {
-                                        println!("tidak berhasil ke save");
-                                    }
-                                }
-                            }
-                            LogType::APPEND => {
-                                // TODO
-
-                                let res = self.data.get(&log.key);
-                                match res {
-                                    Some(old_val) => {
-                                        // old_val.push_str(&log.val);
-                                        let new_string = format!("{0}{1}", old_val, log.val);
-                                        self.data.insert(log.key.clone(), new_string);
-                                    }
-                                    None => {}
-                                }
-                            }
-                            LogType::DEL => {
-                                self.data.remove(&log.key);
-                            }
-                            _default => {}
-                        }
-                    }
-                    self.last_applied = i;
-                }
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::AdvanceCommit { result_sender } => {
-                // 50% + 1, match_index[i] >= n &  log[n].term == currentTerm
-                let mut n = self.commit_index + 1;
-                while n < self.log.len() as i32 {
-                    let mut count = 1;
-                    for idx in self.match_index.clone() {
-                        if idx >= n {
-                            count += 1;
-                        }
-                    }
-                    if count > self.cluster_addr_list.len() / 2
-                        && self.log[n as usize].term == self.election_term
-                    {
-                        self.commit_index = n;
-                    }
-                    n += 1;
-                }
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::PushLog {
-                log_type,
-                key,
-                val,
-                result_sender,
-            } => {
-                self.log.push(Log {
-                    log_type,
-                    key,
-                    val,
-                    term: self.election_term,
-                });
-                let _ = result_sender.send(Ok(()));
-            }
-            Command::GetVal { key, result_sender } => match self.data.get(&key) {
-                Some(val) => {
-                    let _ = result_sender.send(Ok(val.to_string()));
-                }
-                None => {
-                    println!("kok nggak dapet???? key: {}", key);
-                    let _ = result_sender.send(Err(()));
-                }
-            },
-            Command::ChangeLog {
-                new_logs,
-                result_sender,
-            } => {
-                self.log = new_logs;
-                println!("change log debug {:?}", self.log);
-                let _ = result_sender.send(Ok(()));
-            }
-        }
-    }
-}
-
-async fn run_my_actor(mut actor: Node) {
-    while let Some(msg) = actor.receiver.recv().await {
-        actor.handle_command(msg).await;
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct MyActorHandle {
-    sender: mpsc::Sender<Command>,
-}
-
-impl MyActorHandle {
-    pub fn new(address: Address, node_type: NodeType, cluster_leader_addr: Address) -> Self {
-        let (sender, receiver) = mpsc::channel(8);
-        let actor = Node::new(receiver, address, node_type, cluster_leader_addr);
-        tokio::spawn(run_my_actor(actor));
-        Self { sender }
-    }
-
-    pub async fn init(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::Init {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn reinit(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ReInit {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn init_as_leader(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::InitAsLeader {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn get_address(&self) -> Address {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetAddress {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-
-    pub async fn change_address(&self, ip: String) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ChangeAddress {
-            ip,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn get_type(&self) -> NodeType {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetType {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-
-    pub async fn get_leader(&self) -> Address {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetLeader {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-
-    pub async fn add_member(&self, address: Address) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::AddMember {
-            address,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn send_entries(&self, index: i32) -> bool {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SendEntries {
-            result_sender: (send),
-            index,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-
-    pub async fn update_converted(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::UpdateConverted {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-
-    pub async fn get_term(&self) -> i32 {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetTerm {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn get_cluster_count(&self) -> i32 {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetClusterCount {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn prepare_vote(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::PrepareVote {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn update_cluster(&self, list: Vec<raft_service::Address>) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::UpdateCluster {
-            list,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn reset_ctr(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ResetCtr {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn inc_ctr(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::IncCtr {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn get_ctr(&self) -> i32 {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetCtr {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn sync_cluster(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SyncCluster {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn change_type(&self, new_type: NodeType) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ChangeType {
-            new_type,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn set_term(&self, term: i32) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SetTerm {
-            term,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn get_log(&self) -> Vec<Log> {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetLog {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn get_voted_for(&self) -> Option<Address> {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetVotedFor {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn set_voted_for(&self, cluster_idx: i32) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SetVotedFor {
-            cluster_idx,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn set_leader(&self, cluster_idx: i32) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SetLeader {
-            cluster_idx,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn send_vote(&self, index: i32) -> bool {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SendVote {
-            result_sender: (send),
-            index,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn set_commit_index(&self, index: i32) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::SetCommitIndex {
-            index,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn get_commit_index(&self) -> i32 {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetCommitIndex {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn apply_committed_entries(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ApplyCommittedEntries {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn advance_commit_index(&self) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::AdvanceCommit {
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn push_log(&self, log_type: LogType, key: String, val: String) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::PushLog {
-            log_type,
-            key,
-            val,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-    pub async fn get_val(&self, key: String) -> Result<String, ()> {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::GetVal {
-            key,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        recv.await.expect("Actor task has been killed")
-    }
-    pub async fn change_log(&self, new_logs: Vec<Log>) {
-        let (send, recv) = oneshot::channel();
-        let msg = Command::ChangeLog {
-            new_logs,
-            result_sender: send,
-        };
-        let _ = self.sender.send(msg).await;
-        let _ = recv.await.expect("Actor task has been killed");
-    }
-}
-
-// STRUCT IMPLEMENTATION
-// impl LogType {
-//     fn ping() {}
-//     fn get() {}
-//     fn set() {}
-//     fn append() {}
-//     fn del() {}
-//     fn strlen() {}
-// }
-
-impl raft_service::Entries {
-    pub fn create_from_log(log: Log) -> Self {
-        match log.log_type {
-            LogType::SET => {
-                return Entries {
-                    is_set: true,
-                    is_del: false,
-                    is_append: false,
-                    key: log.key,
-                    value: log.val,
-                    term: log.term,
-                }
-            }
-            LogType::APPEND => {
-                return Entries {
-                    is_set: false,
-                    is_del: false,
-                    is_append: true,
-                    key: log.key,
-                    value: log.val,
-                    term: log.term,
-                }
-            }
-            LogType::DEL => {
-                return Entries {
-                    is_set: false,
-                    is_del: true,
-                    is_append: false,
-                    key: log.key,
-                    value: log.val,
-                    term: log.term,
-                }
-            }
-            _default => {
-                return Entries {
-                    is_set: false,
-                    is_del: false,
-                    is_append: false,
-                    key: log.key,
-                    value: log.val,
-                    term: log.term,
-                }
-            }
-        }
-    }
-}
-
-impl Log {
-    pub fn create_from_entries(entries: Entries) -> Self {
-        if entries.is_set {
-            return Log {
-                log_type: LogType::SET,
-                key: entries.key,
-                val: entries.value,
-                term: entries.term,
-            };
-        }
-        if entries.is_append {
-            return Log {
-                log_type: LogType::APPEND,
-                key: entries.key,
-                val: entries.value,
-                term: entries.term,
-            };
-        } else {
-            // asumsi gamungkin type lain
-            return Log {
-                log_type: LogType::DEL,
-                key: entries.key,
-                val: entries.value,
-                term: entries.term,
-            };
-        }
-    }
+fn last_log_index(log: &[LogEntry]) -> i32 {
+    (log.len() as i32) - 1
 }
 
 #[derive(Debug)]
-pub struct MyRaftService {
-    tx: tokio::sync::watch::Sender<i32>,
-    handler: MyActorHandle,
+struct State {
+    me: Addr,
+    is_member: bool,
+
+    role: Role,
+    current_term: i32,
+    voted_for: Option<i32>,
+    leader: Option<Addr>,
+
+    cluster: Vec<Addr>,
+
+    log: Vec<LogEntry>,
+    commit_index: i32,
+    last_applied: i32,
+    kv: HashMap<String, String>,
+
+    next_index: Vec<i32>,
+    match_index: Vec<i32>,
+
+    last_heartbeat: Instant,
 }
 
-#[derive(Debug, Default)]
-pub struct Timeout {}
+impl State {
+    fn majority(&self) -> usize {
+        (self.cluster.len() / 2) + 1
+    }
+
+    fn recompute_cluster_indices(&mut self) {
+        for (i, a) in self.cluster.iter_mut().enumerate() {
+            a.cluster_idx = i as i32;
+        }
+        if let Some(pos) = self.cluster.iter().position(|a| a.equals_no_idx(&self.me)) {
+            self.me.cluster_idx = pos as i32;
+            self.is_member = true;
+        } else {
+            self.is_member = false;
+            self.me.cluster_idx = -1;
+        }
+
+        if let Some(ld) = self.leader.clone() {
+            if let Some(pos) = self.cluster.iter().position(|a| a.equals_no_idx(&ld)) {
+                let mut new_ld = ld.clone();
+                new_ld.cluster_idx = pos as i32;
+                self.leader = Some(new_ld);
+            }
+        }
+    }
+
+    fn ensure_leader_arrays(&mut self) {
+        let n = self.cluster.len();
+        if self.next_index.len() != n {
+            self.next_index = vec![self.log.len() as i32; n];
+        }
+        if self.match_index.len() != n {
+            self.match_index = vec![-1; n];
+        }
+        if self.me.cluster_idx >= 0 {
+            let i = self.me.cluster_idx as usize;
+            if i < self.match_index.len() {
+                self.match_index[i] = last_log_index(&self.log);
+                self.next_index[i] = self.log.len() as i32;
+            }
+        }
+    }
+
+    fn append_entry(&mut self, cmd: CommandType, key: String, value: String) -> i32 {
+        let entry = LogEntry {
+            cmd: cmd as i32,
+            key,
+            value,
+            term: self.current_term,
+        };
+        self.log.push(entry);
+        last_log_index(&self.log)
+    }
+
+    fn apply_commits(&mut self) {
+        while self.last_applied < self.commit_index {
+            self.last_applied += 1;
+            let i = self.last_applied as usize;
+            if i >= self.log.len() {
+                break;
+            }
+            let e = self.log[i].clone();
+            match cmd_from_i32(e.cmd) {
+                CommandType::CmdSet => {
+                    self.kv.insert(e.key, e.value);
+                }
+                CommandType::CmdAppend => {
+                    let old = self
+                        .kv
+                        .get(&e.key)
+                        .cloned()
+                        .unwrap_or_else(|| "".to_string());
+                    self.kv.insert(e.key, format!("{}{}", old, e.value));
+                }
+                CommandType::CmdDel => {
+                    self.kv.remove(&e.key);
+                }
+                CommandType::CmdRemoveMember => {
+                    if let Ok(node_id) = e.value.parse::<i32>() {
+                        if node_id >= 0 && (node_id as usize) < self.cluster.len() {
+                            let remove_addr = self.cluster[node_id as usize].clone();
+                            self.cluster.remove(node_id as usize);
+
+                            if let Some(ld) = self.leader.clone() {
+                                if ld.equals_no_idx(&remove_addr) {
+                                    self.leader = None;
+                                    if self.role == Role::Leader {
+                                        self.role = Role::Follower;
+                                    }
+                                }
+                            }
+
+                            self.recompute_cluster_indices();
+
+                            if !self.is_member {
+                                self.role = Role::Follower;
+                                self.voted_for = None;
+                            }
+
+                            self.next_index.truncate(self.cluster.len());
+                            self.match_index.truncate(self.cluster.len());
+                            self.ensure_leader_arrays();
+                        }
+                    }
+                }
+                _ => {
+                }
+            }
+        }
+    }
+
+    fn advance_commit_index(&mut self) {
+        let mut n = self.commit_index + 1;
+        let last = last_log_index(&self.log);
+        while n <= last {
+            let mut count = 0usize;
+            for (i, _) in self.cluster.iter().enumerate() {
+                if i < self.match_index.len() && self.match_index[i] >= n {
+                    count += 1;
+                }
+            }
+            if count >= self.majority() && self.log[n as usize].term == self.current_term {
+                self.commit_index = n;
+            }
+            n += 1;
+        }
+    }
+}
+
+#[derive(Clone)]
+struct Shared {
+    st: Arc<Mutex<State>>,
+    repl_lock: Arc<Mutex<()>>,
+}
+
+#[derive(Clone)]
+struct MyRaftService {
+    shared: Shared,
+}
+
+impl MyRaftService {
+    async fn redirect_reply(&self) -> ExecuteReply {
+        let st = self.shared.st.lock().await;
+        let leader = st
+            .leader
+            .clone()
+            .unwrap_or_else(|| st.cluster.first().cloned().unwrap_or(st.me.clone()));
+        ExecuteReply {
+            ok: false,
+            message: "NOT_LEADER".to_string(),
+            redirect: true,
+            leader: Some(leader.to_proto()),
+        }
+    }
+
+    async fn redirect_log_reply(&self) -> RequestLogReply {
+        let st = self.shared.st.lock().await;
+        let leader = st
+            .leader
+            .clone()
+            .unwrap_or_else(|| st.cluster.first().cloned().unwrap_or(st.me.clone()));
+        RequestLogReply {
+            ok: false,
+            redirect: true,
+            leader: Some(leader.to_proto()),
+            log: vec![],
+        }
+    }
+
+    async fn replicate_peer_to_end(
+        shared: Shared,
+        peer_idx: usize,
+        need_index: i32,
+        force_one: bool,
+    ) -> bool {
+        let mut sent_once = false;
+
+        loop {
+            if !force_one || sent_once {
+                let st = shared.st.lock().await;
+                if peer_idx < st.match_index.len() && st.match_index[peer_idx] >= need_index {
+                    return true;
+                }
+            }
+
+            let (peer_addr, req) = {
+                let st = shared.st.lock().await;
+
+                if st.role != Role::Leader {
+                    return false;
+                }
+                if peer_idx >= st.cluster.len() {
+                    return true;
+                }
+                if st.me.cluster_idx >= 0 && peer_idx == st.me.cluster_idx as usize {
+                    return true;
+                }
+
+                let peer = st.cluster[peer_idx].clone();
+
+                let next_i = st.next_index.get(peer_idx).cloned().unwrap_or(0);
+                let prev_i = next_i - 1;
+
+                let prev_term = if prev_i >= 0 && (prev_i as usize) < st.log.len() {
+                    st.log[prev_i as usize].term
+                } else {
+                    -1
+                };
+
+                let entries = if next_i >= 0 && (next_i as usize) <= st.log.len() {
+                    st.log[(next_i as usize)..].to_vec()
+                } else {
+                    vec![]
+                };
+
+                let cluster_config = st.cluster.iter().map(|a| a.to_proto()).collect::<Vec<_>>();
+
+                let req = AppendRequest {
+                    term: st.current_term,
+                    leader_id: st.me.cluster_idx,
+                    prev_log_index: prev_i,
+                    prev_log_term: prev_term,
+                    leader_commit: st.commit_index,
+                    entries,
+                    cluster_config,
+                };
+
+                (peer, req)
+            };
+
+            let mut client = match RaftServiceClient::connect(peer_addr.uri()).await {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+
+            let reply = match client.append_entries(Request::new(req)).await {
+                Ok(r) => r.into_inner(),
+                Err(_) => return false,
+            };
+
+            sent_once = true;
+
+            {
+                let mut st = shared.st.lock().await;
+
+                if reply.term > st.current_term {
+                    st.current_term = reply.term;
+                    st.role = Role::Follower;
+                    st.voted_for = None;
+                    st.leader = None;
+                    return false;
+                }
+
+                if st.role != Role::Leader {
+                    return false;
+                }
+
+                if peer_idx >= st.cluster.len() {
+                    return false;
+                }
+
+                if reply.success {
+                    let new_match = last_log_index(&st.log);
+                    st.match_index[peer_idx] = new_match;
+                    st.next_index[peer_idx] = st.log.len() as i32;
+                } else {
+                    let ni = st.next_index.get(peer_idx).cloned().unwrap_or(0);
+                    st.next_index[peer_idx] = (ni - 1).max(0);
+                }
+            }
+        }
+    }
+
+    async fn replicate_to_majority(&self, need_index: i32) -> bool {
+        let _guard = self.shared.repl_lock.lock().await;
+
+        let peers: Vec<usize> = {
+            let mut st = self.shared.st.lock().await;
+            st.ensure_leader_arrays();
+            (0..st.cluster.len()).collect()
+        };
+
+        {
+            let mut st = self.shared.st.lock().await;
+            if st.cluster.len() <= 1 {
+                st.commit_index = st.commit_index.max(need_index);
+                st.apply_commits();
+                return true;
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for idx in peers {
+            let shared = self.shared.clone();
+            tasks.push(tokio::spawn(async move {
+                MyRaftService::replicate_peer_to_end(shared, idx, need_index, false).await
+            }));
+        }
+
+        let mut ack = 0usize;
+        for t in tasks {
+            if let Ok(true) = t.await {
+                ack += 1;
+            }
+        }
+
+        let majority = {
+            let st = self.shared.st.lock().await;
+            st.majority()
+        };
+
+        if ack < majority {
+            return false;
+        }
+
+        {
+            let mut st = self.shared.st.lock().await;
+            if st.role != Role::Leader {
+                return false;
+            }
+            st.advance_commit_index();
+            if st.commit_index >= need_index {
+                st.apply_commits();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    async fn send_heartbeat_round(shared: Shared) {
+        let _guard = shared.repl_lock.lock().await;
+
+        let is_leader = {
+            let st = shared.st.lock().await;
+            st.role == Role::Leader
+        };
+        if !is_leader {
+            return;
+        }
+
+        let peers: Vec<usize> = {
+            let mut st = shared.st.lock().await;
+            st.ensure_leader_arrays();
+            (0..st.cluster.len()).collect()
+        };
+
+        let mut tasks = Vec::new();
+        for idx in peers {
+            let shared2 = shared.clone();
+            let need = {
+                let st = shared2.st.lock().await;
+                last_log_index(&st.log)
+            };
+            tasks.push(tokio::spawn(async move {
+                let _ = MyRaftService::replicate_peer_to_end(shared2, idx, need, true).await;
+            }));
+        }
+
+        for t in tasks {
+            let _ = t.await;
+        }
+
+        {
+            let mut st = shared.st.lock().await;
+            if st.role == Role::Leader {
+                st.advance_commit_index();
+                st.apply_commits();
+            }
+        }
+    }
+}
 
 #[tonic::async_trait]
 impl RaftService for MyRaftService {
-    async fn client(
+    async fn execute(
         &self,
-        request: Request<ClientRequest>,
-    ) -> Result<Response<ClientReply>, Status> {
-        // println!("Got a request: {:?}", request);
-        //
+        request: Request<ExecuteRequest>,
+    ) -> Result<Response<ExecuteReply>, Status> {
+        let req = request.into_inner();
 
-        let _ = self.tx.send(1);
-
-        match request.get_ref().r#type {
-            1 => {
-                return Ok(Response::new(ClientReply {
-                    message: "PONG".to_string(),
-                }))
+        {
+            let st = self.shared.st.lock().await;
+            if !st.is_member {
+                let leader = st
+                    .leader
+                    .clone()
+                    .unwrap_or_else(|| st.cluster.first().cloned().unwrap_or(st.me.clone()));
+                return Ok(Response::new(ExecuteReply {
+                    ok: false,
+                    message: "NOT_MEMBER".to_string(),
+                    redirect: true,
+                    leader: Some(leader.to_proto()),
+                }));
             }
-            2 => match &request.get_ref().key {
-                Some(key) => match self.handler.get_val(key.to_string()).await {
-                    Ok(msg) => {
-                        return Ok(Response::new(ClientReply { message: msg }));
-                    }
-                    Err(_) => return Err(Status::not_found("Key not found")),
-                },
-                None => return Err(Status::invalid_argument("Key required")),
-            },
-            3 => match (&request.get_ref().key, &request.get_ref().val) {
-                (Some(key), Some(val)) => {
-                    self.handler
-                        .push_log(LogType::SET, key.to_string(), val.to_string())
-                        .await;
-                    println!(
-                        "apakah berhasil push log? {}",
-                        self.handler.get_log().await.len()
-                    );
-                    send_entries(self.handler.clone()).await;
-                    self.handler
-                        .set_commit_index(self.handler.get_log().await.len() as i32 - 1)
-                        .await;
-                    self.handler.apply_committed_entries().await;
-                    // ini bisa jadi error ga ya
-                    return Ok(Response::new(ClientReply {
-                        message: "Success".to_string(),
+        }
+
+        {
+            let st = self.shared.st.lock().await;
+            if st.role != Role::Leader {
+                drop(st);
+                return Ok(Response::new(self.redirect_reply().await));
+            }
+        }
+
+        let cmd = cmd_from_i32(req.cmd);
+        match cmd {
+            CommandType::CmdGet => {
+                let st = self.shared.st.lock().await;
+                let v = st
+                    .kv
+                    .get(&req.key)
+                    .cloned()
+                    .unwrap_or_else(|| "".to_string());
+                return Ok(Response::new(ExecuteReply {
+                    ok: true,
+                    message: v,
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            CommandType::CmdPing => {
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdPing, "".to_string(), "".to_string())
+                };
+                let ok = self.replicate_to_majority(idx).await;
+                if !ok {
+                    return Ok(Response::new(ExecuteReply {
+                        ok: false,
+                        message: "FAILED_TO_COMMIT".to_string(),
+                        redirect: false,
+                        leader: None,
                     }));
                 }
-                (None, None) | (Some(_), None) | (None, Some(_)) => {
-                    return Err(Status::invalid_argument("Key and Val required"))
-                }
-            },
-            4 => {
-                return Ok(Response::new(ClientReply {
+                return Ok(Response::new(ExecuteReply {
+                    ok: true,
                     message: "PONG".to_string(),
-                }))
-            }
-            5 => {
-                return Ok(Response::new(ClientReply {
-                    message: "PONG".to_string(),
-                }))
-            }
-            6 => {
-                return Ok(Response::new(ClientReply {
-                    message: "PONG".to_string(),
-                }))
-            }
-            7 => {
-                return Ok(Response::new(ClientReply {
-                    message: "PONG".to_string(),
-                }))
+                    redirect: false,
+                    leader: None,
+                }));
             }
 
-            _default => Err(Status::unimplemented("Request type not implemented")),
+            CommandType::CmdSet => {
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdSet, req.key.clone(), req.value.clone())
+                };
+                let ok = self.replicate_to_majority(idx).await;
+                let msg = if ok { "Success" } else { "FAILED_TO_COMMIT" };
+                return Ok(Response::new(ExecuteReply {
+                    ok,
+                    message: msg.to_string(),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            CommandType::CmdAppend => {
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdAppend, req.key.clone(), req.value.clone())
+                };
+                let ok = self.replicate_to_majority(idx).await;
+                let msg = if ok { "Success" } else { "FAILED_TO_COMMIT" };
+                return Ok(Response::new(ExecuteReply {
+                    ok,
+                    message: msg.to_string(),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            CommandType::CmdDel => {
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdDel, req.key.clone(), "".to_string())
+                };
+                let ok = self.replicate_to_majority(idx).await;
+                let msg = if ok { "Success" } else { "FAILED_TO_COMMIT" };
+                return Ok(Response::new(ExecuteReply {
+                    ok,
+                    message: msg.to_string(),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            CommandType::CmdStrlen => {
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdStrlen, req.key.clone(), "".to_string())
+                };
+                let ok = self.replicate_to_majority(idx).await;
+                if !ok {
+                    return Ok(Response::new(ExecuteReply {
+                        ok: false,
+                        message: "FAILED_TO_COMMIT".to_string(),
+                        redirect: false,
+                        leader: None,
+                    }));
+                }
+                let st = self.shared.st.lock().await;
+                let v = st
+                    .kv
+                    .get(&req.key)
+                    .cloned()
+                    .unwrap_or_else(|| "".to_string());
+                return Ok(Response::new(ExecuteReply {
+                    ok: true,
+                    message: format!("{}", v.len()),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            CommandType::CmdRemoveMember => {
+                let node_id_str = format!("{}", req.node_id);
+
+                {
+                    let st = self.shared.st.lock().await;
+                    if req.node_id == st.me.cluster_idx {
+                        return Ok(Response::new(ExecuteReply {
+                            ok: false,
+                            message: "CANNOT_REMOVE_SELF".to_string(),
+                            redirect: false,
+                            leader: None,
+                        }));
+                    }
+                }
+
+                let idx = {
+                    let mut st = self.shared.st.lock().await;
+                    st.append_entry(CommandType::CmdRemoveMember, "".to_string(), node_id_str)
+                };
+
+                let ok = self.replicate_to_majority(idx).await;
+                let msg = if ok { "Success" } else { "FAILED_TO_COMMIT" };
+                return Ok(Response::new(ExecuteReply {
+                    ok,
+                    message: msg.to_string(),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
+
+            _ => {
+                return Ok(Response::new(ExecuteReply {
+                    ok: false,
+                    message: "UNIMPLEMENTED".to_string(),
+                    redirect: false,
+                    leader: None,
+                }));
+            }
         }
+    }
+
+    async fn request_log(
+        &self,
+        _request: Request<RequestLogRequest>,
+    ) -> Result<Response<RequestLogReply>, Status> {
+        {
+            let st = self.shared.st.lock().await;
+            if !st.is_member {
+                let leader = st
+                    .leader
+                    .clone()
+                    .unwrap_or_else(|| st.cluster.first().cloned().unwrap_or(st.me.clone()));
+                return Ok(Response::new(RequestLogReply {
+                    ok: false,
+                    redirect: true,
+                    leader: Some(leader.to_proto()),
+                    log: vec![],
+                }));
+            }
+        }
+
+        {
+            let st = self.shared.st.lock().await;
+            if st.role != Role::Leader {
+                drop(st);
+                return Ok(Response::new(self.redirect_log_reply().await));
+            }
+        }
+
+        let idx = {
+            let mut st = self.shared.st.lock().await;
+            st.append_entry(CommandType::CmdRequestLog, "".to_string(), "".to_string())
+        };
+        let ok = self.replicate_to_majority(idx).await;
+        if !ok {
+            return Ok(Response::new(RequestLogReply {
+                ok: false,
+                redirect: false,
+                leader: None,
+                log: vec![],
+            }));
+        }
+
+        let st = self.shared.st.lock().await;
+        Ok(Response::new(RequestLogReply {
+            ok: true,
+            redirect: false,
+            leader: None,
+            log: st.log.clone(),
+        }))
     }
 
     async fn append_entries(
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendReply>, Status> {
-        let request_raw = request.get_ref();
+        let req = request.into_inner();
 
-        //TODO: reply false kalay term < currentTerm
-        if self.handler.get_term().await > request_raw.term {
-            let reply = AppendReply {
-                term: self.handler.get_term().await,
+        let mut st = self.shared.st.lock().await;
+
+        if req.term < st.current_term {
+            return Ok(Response::new(AppendReply {
+                term: st.current_term,
                 success: false,
-            };
-            println!("kekirim false1");
-            return Ok(Response::new(reply));
-        }
-        let mut my_logs = self.handler.get_log().await;
-
-        if request_raw.leader_commit > self.handler.get_commit_index().await {
-            println!(
-                "leader commit: {0}, but my log len - 1 is {1}",
-                request_raw.leader_commit,
-                my_logs.len() as i32 - 1
-            );
-            self.handler
-                .set_commit_index(cmp::min(
-                    request_raw.leader_commit,
-                    my_logs.len() as i32 - 1,
-                ))
-                .await;
-            println!(
-                "my updated commit index? {}",
-                self.handler.get_commit_index().await
-            );
+            }));
         }
 
-        // println!("my logs : {:?}", my_logs);
-
-        self.handler.apply_committed_entries().await;
-        if request_raw.entries.len() == 0 {
-            let reply = AppendReply {
-                term: self.handler.get_term().await,
-                success: true,
-            };
-            let _ = self.tx.send(1);
-            return Ok(Response::new(reply));
+        if req.term > st.current_term {
+            st.current_term = req.term;
+            st.role = Role::Follower;
+            st.voted_for = None;
         }
 
-        //TODO: cek entry sendiri, self.log[prev_log_index] ada atau nggak, trs cek self.log[prev_log_index].term != prev_log_term then
-        if self.handler.get_log().await.len() != 0 && request_raw.prev_log_index != -1 {
-            if self.handler.get_log().await.len() as i32 > request_raw.prev_log_index {
-                // println!("prev log index debug: {}", request_raw.prev_log_index);
-                if self.handler.get_log().await[request_raw.prev_log_index as usize].term
-                    != request_raw.prev_log_term
-                {
-                    let reply = AppendReply {
-                        term: self.handler.get_term().await,
-                        success: false,
-                    };
-                    println!("kekirim false2");
-                    return Ok(Response::new(reply));
+        if !req.cluster_config.is_empty() {
+            st.cluster = req
+                .cluster_config
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Addr {
+                    ip: a.ip.clone(),
+                    port: a.port.clone(),
+                    cluster_idx: i as i32,
+                })
+                .collect();
+            st.recompute_cluster_indices();
+        }
+
+        if req.leader_id >= 0 && (req.leader_id as usize) < st.cluster.len() {
+            st.leader = Some(st.cluster[req.leader_id as usize].clone());
+        }
+
+        st.last_heartbeat = Instant::now();
+
+        st.role = Role::Follower;
+
+        if req.prev_log_index >= 0 {
+            let pli = req.prev_log_index as usize;
+            if pli >= st.log.len() {
+                return Ok(Response::new(AppendReply {
+                    term: st.current_term,
+                    success: false,
+                }));
+            }
+            if st.log[pli].term != req.prev_log_term {
+                return Ok(Response::new(AppendReply {
+                    term: st.current_term,
+                    success: false,
+                }));
+            }
+        }
+
+        let mut insert_at = (req.prev_log_index + 1) as usize;
+
+        for incoming in req.entries.iter() {
+            if insert_at < st.log.len() {
+                if st.log[insert_at].term != incoming.term {
+                    st.log.truncate(insert_at);
+                    st.log.push(incoming.clone());
+                } else {
                 }
             } else {
-                let reply = AppendReply {
-                    term: self.handler.get_term().await,
-                    success: false,
-                };
-                println!("kekirim false3");
-                return Ok(Response::new(reply));
+                st.log.push(incoming.clone());
             }
+            insert_at += 1;
         }
 
-        let mut new_logs = Vec::new();
-        for entry in request_raw.entries.clone() {
-            new_logs.push(Log::create_from_entries(entry));
+        let last_idx = last_log_index(&st.log);
+        if req.leader_commit > st.commit_index {
+            st.commit_index = std::cmp::min(req.leader_commit, last_idx);
         }
+        st.apply_commits();
 
-        let mut ctr = 0;
-
-        //TODO: if content dari self.log[prev_log_index+1] != new_entries[0], and self.log[prev_log_index+1].term != new_entries[0].term (kalo existing)
-        if self.handler.get_log().await.len() as i32 - 1 != request_raw.prev_log_index {
-            let idx = request_raw.prev_log_index as i32 + 1;
-            println!(
-                "idx = {0}, log.len() = {1}",
-                idx,
-                self.handler.get_log().await.len(),
-            );
-            if self.handler.get_log().await[idx as usize] != new_logs[0] {
-                for i in request_raw.prev_log_index as usize + 1..self.handler.get_log().await.len()
-                {
-                    println!("prev log index debug: {}", request_raw.prev_log_index);
-                    my_logs[i] = new_logs[ctr].clone();
-                    ctr += 1;
-                }
-            }
-        }
-
-        //TODO: kalo ga existing di push (append)
-        for i in ctr..new_logs.len() {
-            my_logs.push(new_logs[i].clone());
-        }
-        println!("my logs : {:?}", my_logs);
-
-        self.handler.change_log(my_logs.clone()).await;
-
-        //TODO: kalau request.leader_commit > self.commit_index, set commit_index = min(leader
-        //commit dengan index of last index), trs langsung apply commit
-
-        if request_raw.leader_commit > self.handler.get_commit_index().await {
-            self.handler
-                .set_commit_index(cmp::min(
-                    request_raw.leader_commit,
-                    my_logs.len() as i32 - 1,
-                ))
-                .await;
-        }
-
-        self.handler.apply_committed_entries().await;
-
-        // request_raw.leader_id
-        // println!("i got the leader id: {:?}", request_raw.leader_id);
-        self.handler.change_type(NodeType::FOLLOWER).await;
-        self.handler.set_term(request_raw.term).await;
-        self.handler
-            .update_cluster(request_raw.cluster_addr_list.clone())
-            .await;
-        self.handler.set_leader(request_raw.leader_id).await;
-
-        //TODO: cek flush commit index
-        let current_term = self.handler.get_term().await;
-
-        let reply = AppendReply {
-            term: current_term,
+        Ok(Response::new(AppendReply {
+            term: st.current_term,
             success: true,
-        };
-        let _ = self.tx.send(1);
-        Ok(Response::new(reply))
+        }))
     }
 
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
-        let _ = self.tx.send(1);
-        let request_raw = request.get_ref();
-        let current_term = self.handler.get_term().await;
-        let voted_for = self.handler.get_voted_for().await;
-        let candidate_term = request_raw.term;
-        let current_log = self.handler.get_log().await;
-        let candidate_id = request_raw.candidate_id;
+        let req = request.into_inner();
+        let mut st = self.shared.st.lock().await;
 
-        // Candidate term harus lebih gede dari current term
-        if candidate_term < current_term {
+        if !st.is_member {
             return Ok(Response::new(VoteReply {
-                term: current_term,
+                term: st.current_term,
                 vote_granted: false,
             }));
-        } else if candidate_term > current_term {
-            self.handler.set_term(candidate_term).await;
-            self.handler.set_voted_for(-1).await;
         }
 
-        println!("dapet vote me niii: {:?}", request_raw);
-        println!(
-            "my cluster idx: {}",
-            self.handler.get_address().await.cluster_idx
-        );
-
-        // voted_for harus null / candidate yg sama
-        let voted_for_ok =
-            voted_for.is_none() || voted_for.as_ref().unwrap().cluster_idx == candidate_id;
-
-        // Cek candiidate log harus up to date <=
-        let log_up_to_date = check_up_to_date(
-            current_log,
-            request_raw.last_log_index,
-            request_raw.last_log_term,
-        );
-
-        // Cek myself, kirim ke diri sendiri juga soalnya voting
-        let check_is_myself =
-            request_raw.candidate_id == self.handler.get_address().await.cluster_idx;
-
-        if (voted_for_ok && log_up_to_date) || check_is_myself {
-            self.handler.set_voted_for(request_raw.candidate_id).await;
+        if req.term < st.current_term {
+            return Ok(Response::new(VoteReply {
+                term: st.current_term,
+                vote_granted: false,
+            }));
         }
 
-        let reply = VoteReply {
-            term: self.handler.get_term().await,
-            vote_granted: (voted_for_ok && log_up_to_date) || check_is_myself,
-        };
+        if req.term > st.current_term {
+            st.current_term = req.term;
+            st.voted_for = None;
+            st.role = Role::Follower;
+        }
 
-        // Respond
-        println!("niii replynyaa: {:?}", reply);
-        Ok(Response::new(reply))
+        st.last_heartbeat = Instant::now();
+
+        let my_last_term = last_log_term(&st.log);
+        let my_last_idx = last_log_index(&st.log);
+
+        let up_to_date = (req.last_log_term > my_last_term)
+            || (req.last_log_term == my_last_term && req.last_log_index >= my_last_idx);
+
+        let voted_ok = st.voted_for.is_none() || st.voted_for == Some(req.candidate_id);
+
+        let grant = voted_ok && up_to_date;
+        if grant {
+            st.voted_for = Some(req.candidate_id);
+        }
+
+        Ok(Response::new(VoteReply {
+            term: st.current_term,
+            vote_granted: grant,
+        }))
     }
 
     async fn membership(
         &self,
         request: Request<MembershipRequest>,
     ) -> Result<Response<MembershipReply>, Status> {
-        let leader_addr = self.handler.get_leader().await;
+        let req = request.into_inner();
+        let mut st = self.shared.st.lock().await;
 
-        let mut reply = MembershipReply {
-            ip_addr: leader_addr.ip,
-            port: leader_addr.port,
-            status: true,
-            id: -1,
-        };
-
-        if self.handler.get_type().await != NodeType::LEADER {
-            reply.status = false;
-        } else {
-            reply.id = self.handler.get_cluster_count().await;
-            let new_addr = Address {
-                cluster_idx: self.handler.get_cluster_count().await,
-                ip: request.get_ref().ip_addr.clone(),
-                port: request.get_ref().port.clone(),
-            };
-            self.handler.add_member(new_addr).await;
+        if st.role != Role::Leader {
+            let leader = st
+                .leader
+                .clone()
+                .unwrap_or_else(|| st.cluster.first().cloned().unwrap_or(st.me.clone()));
+            return Ok(Response::new(MembershipReply {
+                ok: false,
+                leader: Some(leader.to_proto()),
+                assigned_id: -1,
+                cluster_config: vec![],
+            }));
         }
 
-        Ok(Response::new(reply))
+        let new_addr = Addr {
+            ip: req.ip_addr.clone(),
+            port: req.port.clone(),
+            cluster_idx: st.cluster.len() as i32,
+        };
+
+        if st.cluster.iter().any(|a| a.equals_no_idx(&new_addr)) {
+            let assigned = st
+                .cluster
+                .iter()
+                .position(|a| a.equals_no_idx(&new_addr))
+                .unwrap() as i32;
+            let cfg = st.cluster.iter().map(|a| a.to_proto()).collect::<Vec<_>>();
+            return Ok(Response::new(MembershipReply {
+                ok: true,
+                leader: Some(st.me.to_proto()),
+                assigned_id: assigned,
+                cluster_config: cfg,
+            }));
+        }
+
+        st.cluster.push(new_addr);
+        st.recompute_cluster_indices();
+        st.ensure_leader_arrays();
+
+        let assigned_id = (st.cluster.len() as i32) - 1;
+        let cfg = st.cluster.iter().map(|a| a.to_proto()).collect::<Vec<_>>();
+
+        Ok(Response::new(MembershipReply {
+            ok: true,
+            leader: Some(st.me.to_proto()),
+            assigned_id,
+            cluster_config: cfg,
+        }))
     }
 }
 
-async fn receiver(
-    tx: tokio::sync::watch::Sender<i32>,
-    actor_handler: MyActorHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-    let ip_addr = &args[1];
-    let port = &args[2];
-    let mut addr_str = String::from("");
-    addr_str.push_str(ip_addr);
-    addr_str.push(':');
-    addr_str.push_str(port);
-    let addr = addr_str.parse()?;
-    let raft_service = MyRaftService {
-        tx,
-        handler: actor_handler,
-    };
-
-    Server::builder()
-        .add_service(RaftServiceServer::new(raft_service))
-        .serve(addr)
-        .await?;
-
-    Ok(())
-}
-
-async fn send_entries(actor_handler: MyActorHandle) {
-    actor_handler.update_converted().await;
-    actor_handler.sync_cluster().await;
-    actor_handler.reset_ctr().await;
-
-    let threads: Vec<_> = (0..actor_handler.get_cluster_count().await)
-        .map(|i| {
-            let new_handler = actor_handler.clone();
-            tokio::spawn(async move {
-                if new_handler.send_entries(i).await {
-                    new_handler.inc_ctr().await
-                }
-            })
-        })
-        .collect();
-    // TODO: handle kalau udah mayoritas commmit, baru kita commit
-    for handle in threads {
-        let _ = handle.await.unwrap();
-    }
-    println!("Success responses: {}", actor_handler.get_ctr().await);
-}
-
-async fn sender(
-    rx: &mut tokio::sync::watch::Receiver<i32>,
-    actor_handler: MyActorHandle,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if actor_handler.get_type().await == NodeType::LEADER {
-        actor_handler.init_as_leader().await;
-    } else {
-        actor_handler.init().await;
-    }
+async fn join_cluster(shared: Shared, seed_leader: Addr) {
     loop {
-        println!("looping time!");
-        println!("my state isssss : {:?}", actor_handler.get_type().await);
-        match actor_handler.get_type().await {
-            NodeType::LEADER => match timeout(Duration::from_millis(1000), rx.changed()).await {
-                Ok(_) => println!("uwauwa"),
-                Err(_) => {
-                    println!("heartbeat time baby!");
-                    send_entries(actor_handler.clone()).await;
-                }
-            },
-            NodeType::FOLLOWER => {
-                match timeout(
-                    Duration::from_millis(random_range(4500..5000)),
-                    rx.changed(),
-                )
-                .await
-                {
-                    // TODO: KALAU TIMEOUT JADI CANDIDATEEE
-                    Ok(_) => println!("not time out yayyy"),
-                    Err(_) => {
-                        println!("time out brow");
-                        actor_handler.change_type(NodeType::CANDIDATE).await;
-                    }
-                }
-            }
-            NodeType::CANDIDATE => {
-                actor_handler.reset_ctr().await;
-                actor_handler.prepare_vote().await;
-                actor_handler.sync_cluster().await;
-                let mut task_one =
-                    async || match timeout(Duration::from_millis(4000), rx.changed()).await {
-                        Ok(_) => {
-                            println! {"kena speed diff-----------"}
-                        }
-                        Err(_) => {
-                            println!("damn vote time out, starting new one...");
-                        }
-                    };
-                let task_two = async || {
-                    // let cap = value.get_cluster_count().await as usize;
-                    // let mut handles = Vec::with_capacity(cap);
-                    // let barrier = Arc::new(cap);
-                    //
-                    // for i in 0..cap {
-                    //     let c = barrier.clone();
-                    //
-                    //     handles.push(tokio::spawn(async move {
-                    //         let new_handler = value.clone();
-                    //         if new_handler.send_vote(i as i32).await {
-                    //             new_handler.inc_ctr().await;
-                    //         }
-                    //         println!("gey")
-                    //     }));
-                    // }
+        let me = {
+            let st = shared.st.lock().await;
+            st.me.clone()
+        };
 
-                    let my_cluster = actor_handler.get_address().await.cluster_idx;
-                    let threads: Vec<_> = (0..actor_handler.get_cluster_count().await)
-                        .map(|i| {
-                            let new_handler = actor_handler.clone();
-                            if my_cluster == i {
-                                tokio::spawn(async move {})
-                            } else {
-                                tokio::spawn(async move {
-                                    if new_handler.send_vote(i).await {
-                                        new_handler.inc_ctr().await
-                                    }
-                                })
-                            }
-                        })
-                        .collect();
-                    println!("lewat sini ga?");
-                    for handle in threads {
-                        println!("debug handle: {:?}", handle);
-                        let _ = handle.await.unwrap();
-                    }
-                    println!("lewat sini ga2?");
-                    if actor_handler.get_ctr().await + 1
-                        > (actor_handler.get_cluster_count().await / 2)
-                    {
-                        actor_handler.change_type(NodeType::LEADER).await;
-                        actor_handler.reinit().await;
-                        println!("lewat sini ga3?");
-                    }
-                };
+        let mut leader = seed_leader.clone();
 
-                tokio::select! {
-                    _ = task_one() => {
-                        println!("one wins")
-                    }
-                    _ = task_two() => {
-                        println!("two wins")
-                    }
-
-                }
+        let conn = RaftServiceClient::connect(leader.uri()).await;
+        let mut client = match conn {
+            Ok(c) => c,
+            Err(_) => {
+                sleep(Duration::from_millis(500)).await;
+                continue;
             }
         };
+
+        let resp = client
+            .membership(Request::new(MembershipRequest {
+                ip_addr: me.ip.clone(),
+                port: me.port.clone(),
+            }))
+            .await;
+
+        let reply = match resp {
+            Ok(r) => r.into_inner(),
+            Err(_) => {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        };
+
+        if !reply.ok {
+            if let Some(ld) = reply.leader {
+                leader = Addr {
+                    ip: ld.ip,
+                    port: ld.port,
+                    cluster_idx: ld.cluster_idx,
+                };
+                sleep(Duration::from_millis(200)).await;
+                continue;
+            } else {
+                sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+        }
+
+        {
+            let mut st = shared.st.lock().await;
+            st.cluster = reply
+                .cluster_config
+                .iter()
+                .enumerate()
+                .map(|(i, a)| Addr {
+                    ip: a.ip.clone(),
+                    port: a.port.clone(),
+                    cluster_idx: i as i32,
+                })
+                .collect();
+
+            st.recompute_cluster_indices();
+            st.is_member = true;
+
+            if let Some(ld) = reply.leader {
+                st.leader = Some(Addr {
+                    ip: ld.ip,
+                    port: ld.port,
+                    cluster_idx: ld.cluster_idx,
+                });
+            } else {
+                st.leader = Some(leader.clone());
+            }
+
+            st.role = Role::Follower;
+            st.last_heartbeat = Instant::now();
+        }
+
+        println!("Joined cluster successfully.");
+        return;
+    }
+}
+
+async fn election_task(shared: Shared) {
+    let mut timeout_ms: u64 = rand::random_range(4500..5000);
+
+    loop {
+        sleep(Duration::from_millis(50)).await;
+
+        let (me_idx, peers, last_term, last_idx, majority) = {
+            let st = shared.st.lock().await;
+
+            if !st.is_member {
+                continue;
+            }
+
+            if st.role == Role::Leader {
+                continue;
+            }
+
+            let elapsed = st.last_heartbeat.elapsed().as_millis() as u64;
+            if elapsed < timeout_ms {
+                continue;
+            }
+
+            (
+                st.me.cluster_idx,
+                st.cluster.clone(),
+                last_log_term(&st.log),
+                last_log_index(&st.log),
+                st.majority(),
+            )
+        };
+
+        {
+            let mut st = shared.st.lock().await;
+            st.role = Role::Candidate;
+            st.current_term += 1;
+            st.voted_for = Some(st.me.cluster_idx);
+            st.last_heartbeat = Instant::now();
+        }
+
+        let my_term = {
+            let st = shared.st.lock().await;
+            st.current_term
+        };
+
+        let mut tasks = Vec::new();
+        for p in peers.iter() {
+            if me_idx >= 0 && p.cluster_idx == me_idx {
+                continue;
+            }
+            let addr = p.clone();
+            let shared2 = shared.clone();
+            let req = VoteRequest {
+                term: my_term,
+                candidate_id: me_idx,
+                last_log_index: last_idx,
+                last_log_term: last_term,
+            };
+
+            tasks.push(tokio::spawn(async move {
+                let mut client = RaftServiceClient::connect(addr.uri()).await.ok()?;
+                let r = client.vote_me(Request::new(req)).await.ok()?.into_inner();
+
+                {
+                    let mut st = shared2.st.lock().await;
+                    if r.term > st.current_term {
+                        st.current_term = r.term;
+                        st.role = Role::Follower;
+                        st.voted_for = None;
+                        st.leader = None;
+                    }
+                }
+
+                Some(r.vote_granted)
+            }));
+        }
+
+        let mut votes = 1usize;
+        for t in tasks {
+            if let Ok(Some(true)) = t.await {
+                votes += 1;
+            }
+        }
+
+        {
+            let mut st = shared.st.lock().await;
+
+            if st.role != Role::Candidate || st.current_term != my_term {
+                timeout_ms = rand::random_range(4500..5000);
+                continue;
+            }
+
+            if votes >= majority {
+                st.role = Role::Leader;
+                st.leader = Some(st.me.clone());
+                st.ensure_leader_arrays();
+                st.last_heartbeat = Instant::now();
+                println!(
+                    "Elected as LEADER. term={} votes={}",
+                    st.current_term, votes
+                );
+            } else {
+                st.role = Role::Follower;
+                st.voted_for = None;
+                st.last_heartbeat = Instant::now();
+                println!("Election failed. term={} votes={}", st.current_term, votes);
+            }
+        }
+
+        timeout_ms = rand::random_range(4500..5000);
+    }
+}
+
+async fn heartbeat_task(shared: Shared) {
+    loop {
+        sleep(Duration::from_millis(1000)).await;
+        MyRaftService::send_heartbeat_round(shared.clone()).await;
     }
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
-    if args.len() < 3 {
-        panic!("Brow aint no way salah input: liat readme pls")
+    if args.len() != 3 && args.len() != 5 {
+        panic!("Usage:\n  server <ip> <port> [leader_ip leader_port]");
     }
 
-    let my_address = Address {
-        ip: args[1].clone(),
-        port: args[2].clone(),
+    let ip = args[1].clone();
+    let port = args[2].clone();
+
+    let me = Addr {
+        ip: ip.clone(),
+        port: port.clone(),
         cluster_idx: -1,
     };
 
-    if args.len() == 5 {
-        let leader_address = Address {
+    let is_leader_start = args.len() == 3;
+    let seed_leader = if !is_leader_start {
+        Some(Addr {
             ip: args[3].clone(),
             port: args[4].clone(),
             cluster_idx: -1,
-        };
-        let my_actor_handle = MyActorHandle::new(my_address, NodeType::FOLLOWER, leader_address);
-        let my_actor_handler_clone = my_actor_handle.clone();
-        println!("{:?}", my_actor_handle.get_address().await);
-        let (tx, mut rx) = watch::channel::<i32>(0);
-        tokio::spawn(async {
-            let _ = receiver(tx, my_actor_handle).await;
-        });
-        tokio::spawn(async move {
-            let _ = sender(&mut rx, my_actor_handler_clone).await;
-        });
-        let ctrl_c = signal::ctrl_c();
-        println!("Press Ctrl+C to exit...");
-        ctrl_c.await.expect("Ctrl+C signal failed");
-        println!("Ctrl+C received. Exiting...");
-        Ok(())
+        })
     } else {
-        let my_actor_handle = MyActorHandle::new(my_address.clone(), NodeType::LEADER, my_address);
+        None
+    };
 
-        let my_actor_handler_clone = my_actor_handle.clone();
+    let initial_cluster = if is_leader_start {
+        vec![Addr {
+            ip: ip.clone(),
+            port: port.clone(),
+            cluster_idx: 0,
+        }]
+    } else {
+        vec![]
+    };
 
-        println!("{:?}", my_actor_handle.get_address().await);
+    let state = State {
+        me: if is_leader_start {
+            Addr {
+                ip: ip.clone(),
+                port: port.clone(),
+                cluster_idx: 0,
+            }
+        } else {
+            me.clone()
+        },
+        is_member: is_leader_start,
+        role: if is_leader_start {
+            Role::Leader
+        } else {
+            Role::Follower
+        },
+        current_term: if is_leader_start { 1 } else { 0 },
+        voted_for: if is_leader_start { Some(0) } else { None },
+        leader: if is_leader_start {
+            Some(Addr {
+                ip: ip.clone(),
+                port: port.clone(),
+                cluster_idx: 0,
+            })
+        } else {
+            seed_leader.clone()
+        },
+        cluster: initial_cluster,
+        log: vec![],
+        commit_index: -1,
+        last_applied: -1,
+        kv: HashMap::new(),
+        next_index: vec![],
+        match_index: vec![],
+        last_heartbeat: Instant::now(),
+    };
 
-        let (tx, mut rx) = watch::channel::<i32>(0);
+    let shared = Shared {
+        st: Arc::new(Mutex::new(state)),
+        repl_lock: Arc::new(Mutex::new(())),
+    };
 
-        tokio::spawn(async {
-            let _ = receiver(tx, my_actor_handle).await;
-        });
+    if let Some(ld) = seed_leader {
+        let shared2 = shared.clone();
         tokio::spawn(async move {
-            let _ = sender(&mut rx, my_actor_handler_clone).await;
+            join_cluster(shared2, ld).await;
         });
-        let ctrl_c = signal::ctrl_c();
-        println!("Press Ctrl+C to exit...");
-        ctrl_c.await.expect("Ctrl+C signal failed");
-        println!("Ctrl+C received. Exiting...");
-        Ok(())
     }
+
+    tokio::spawn(election_task(shared.clone()));
+    tokio::spawn(heartbeat_task(shared.clone()));
+
+    let svc = MyRaftService { shared };
+
+    let addr = format!("{}:{}", ip, port).parse()?;
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(RaftServiceServer::new(svc))
+            .serve(addr)
+            .await
+            .unwrap();
+    });
+
+    println!("Server running on {}:{}", ip, port);
+    println!("Press Ctrl+C to exit...");
+    signal::ctrl_c().await?;
+    println!("Ctrl+C received. Exiting...");
+    Ok(())
 }
