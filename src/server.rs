@@ -1,11 +1,11 @@
 use raft_service::raft_service_client::RaftServiceClient;
 use raft_service::raft_service_server::{RaftService, RaftServiceServer};
-
 use raft_service::{
     AppendReply, AppendRequest, ClientReply, ClientRequest, MembershipReply, MembershipRequest,
     VoteReply, VoteRequest,
 };
 use rand::random_range;
+use std::cmp;
 use std::collections::HashMap;
 use std::env;
 use tokio::signal;
@@ -21,7 +21,7 @@ pub mod raft_service {
 }
 
 // STRUCT
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub enum LogType {
     PING,
     GET,
@@ -31,7 +31,7 @@ pub enum LogType {
     STRLEN,
 }
 
-#[derive(PartialEq, Clone)]
+#[derive(PartialEq, Clone, Debug)]
 pub struct Log {
     log_type: LogType,
     key: String,
@@ -40,24 +40,16 @@ pub struct Log {
 }
 
 pub fn check_up_to_date(src: Vec<Log>, lastlogindex: i32, lastlogterm: i32) -> bool {
-    println!("debug21");
     if src.len() == 0 {
-        println!("debug 211");
         return true;
     }
-    println!("debug22");
     let last_log = src[src.len() - 1].clone();
-    println!("debug23");
     if last_log.term > lastlogterm {
-        println!("debug 231");
         return false;
     }
-    println!("debug24");
     if src.len() as i32 - 1 > lastlogindex {
-        println!("debug 241");
         return false;
     }
-    println!("debug25");
     true
 }
 
@@ -218,6 +210,10 @@ pub enum Command {
         key: String,
         result_sender: oneshot::Sender<Result<String, ()>>,
     },
+    ChangeLog {
+        new_logs: Vec<Log>,
+        result_sender: oneshot::Sender<Result<(), ()>>,
+    },
 }
 
 pub struct Node {
@@ -259,8 +255,8 @@ impl Node {
             cluster_leader_addr,
             election_term: 0,
             voted_for: final_voted_for,
-            commit_index: 0,
-            last_applied: 0,
+            commit_index: -1,
+            last_applied: -1,
             next_index: Vec::new(),
             match_index: Vec::new(),
             converted: Vec::new(),
@@ -270,9 +266,11 @@ impl Node {
 
     fn build_entries(&self, index: i32) -> Vec<Entries> {
         let diff = self.log.len() as i32 - self.next_index[index as usize];
+
         let mut entries = Vec::<Entries>::new();
-        for i in self.log.len() - diff as usize..self.log.len() {
-            entries.push(Entries::create_from_log(self.log[i].clone()));
+        println!("{0}..{1}", self.log.len() as i32 - diff, self.log.len());
+        for i in self.log.len() as i32 - diff..self.log.len() as i32 {
+            entries.push(Entries::create_from_log(self.log[i as usize].clone()));
         }
         entries
     }
@@ -336,95 +334,97 @@ impl Node {
                     if index == self.cluster_leader_addr.cluster_idx {
                         let _ = result_sender.send(true);
                     } else {
-                        match self.log.last() {
-                            Some(lastlog) => {
-                                let conn = RaftServiceClient::connect(x.to_string()).await;
-                                match conn {
-                                    Ok(mut client) => {
-                                        let mut result_bool: bool = false;
-                                        // temporary solution with = here, if something goes out of
-                                        // bound probably is from here
-                                        for _ in (0..=self.log.len()).rev() {
-                                            let request = tonic::Request::new(AppendRequest {
-                                                term: self.election_term,
-                                                leader_id: self.address.cluster_idx,
-                                                prev_log_index: self.log.len() as i32 - 1,
-                                                prev_log_term: lastlog.term,
-                                                leader_commit: self.commit_index,
-                                                entries: self.build_entries(index),
-                                                cluster_addr_list: self.converted.clone(),
-                                            });
-                                            let response = client.append_entries(request).await;
-                                            match response {
-                                                Ok(res) => {
-                                                    if res.get_ref().success {
-                                                        result_bool = true;
-                                                        self.match_index[index as usize] =
-                                                            self.log.len() as i32 - 1;
-                                                        self.next_index[index as usize] =
-                                                            self.match_index[index as usize] + 1;
-                                                        break;
-                                                    } else {
-                                                        result_bool = false;
-                                                        self.next_index[index as usize] -= 1;
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    result_bool = false;
-                                                }
-                                            }
-                                        }
-                                        let _ = result_sender.send(result_bool);
-                                    }
-                                    Err(_) => {
-                                        let _ = result_sender.send(false);
-                                    }
-                                }
-                            }
-                            None => {
-                                let conn = RaftServiceClient::connect(x.to_string()).await;
+                        // match self.log.last() {
+                        //     Some(lastlog) => {
+                        let conn = RaftServiceClient::connect(x.to_string()).await;
+                        match conn {
+                            Ok(mut client) => {
+                                let mut result_bool: bool = false;
 
-                                match conn {
-                                    Ok(mut client) => {
-                                        let mut result_bool: bool = false;
-                                        // temporary solution with = here, if something goes out of
-                                        // bound probably is from here
-                                        for _ in (0..=self.log.len()).rev() {
-                                            let request = tonic::Request::new(AppendRequest {
-                                                term: self.election_term,
-                                                leader_id: self.address.cluster_idx,
-                                                prev_log_index: self.log.len() as i32 - 1,
-                                                prev_log_term: -1,
-                                                leader_commit: self.commit_index,
-                                                entries: self.build_entries(index),
-                                                cluster_addr_list: self.converted.clone(),
-                                            });
-                                            let response = client.append_entries(request).await;
-                                            match response {
-                                                Ok(res) => {
-                                                    if res.get_ref().success {
-                                                        result_bool = true;
-                                                        self.match_index[index as usize] =
-                                                            self.log.len() as i32 - 1;
-                                                        self.next_index[index as usize] =
-                                                            self.match_index[index as usize] + 1;
-                                                        break;
-                                                    } else {
-                                                        result_bool = false;
-                                                        self.next_index[index as usize] -= 1;
-                                                    }
-                                                }
-                                                Err(_) => {
-                                                    result_bool = false;
-                                                }
+                                let mut prev_log_term = -1;
+                                println!("{}", self.match_index[index as usize]);
+                                if self.log.len() > 0 && self.match_index[index as usize] != -1 {
+                                    prev_log_term =
+                                        self.log[self.match_index[index as usize] as usize].term;
+                                }
+
+                                // temporary solution with = here, if something goes out of
+                                // bound probably is from here
+                                //
+
+                                if self.log.len() == 0 {
+                                    let request = tonic::Request::new(AppendRequest {
+                                        term: self.election_term,
+                                        leader_id: self.address.cluster_idx,
+                                        prev_log_index: self.match_index[index as usize],
+                                        prev_log_term: prev_log_term,
+                                        leader_commit: self.commit_index,
+                                        entries: self.build_entries(index),
+                                        cluster_addr_list: self.converted.clone(),
+                                    });
+                                    let response = client.append_entries(request).await;
+                                    match response {
+                                        Ok(res) => {
+                                            if res.get_ref().success {
+                                                result_bool = true;
+                                                self.match_index[index as usize] =
+                                                    self.log.len() as i32 - 1;
+                                                self.next_index[index as usize] =
+                                                    self.match_index[index as usize] + 1;
+                                                println!(
+                                                    "my matching index: {0} from thread: {1}",
+                                                    self.match_index[index as usize], index
+                                                );
+                                            } else {
+                                                result_bool = false;
+                                                self.next_index[index as usize] -= 1;
                                             }
                                         }
-                                        let _ = result_sender.send(result_bool);
+                                        Err(_) => {
+                                            result_bool = false;
+                                        }
                                     }
-                                    Err(_) => {
-                                        let _ = result_sender.send(false);
+                                } else {
+                                    for _ in (0..self.log.len()).rev() {
+                                        let request = tonic::Request::new(AppendRequest {
+                                            term: self.election_term,
+                                            leader_id: self.address.cluster_idx,
+                                            prev_log_index: self.match_index[index as usize],
+                                            prev_log_term: prev_log_term,
+                                            leader_commit: self.commit_index,
+                                            entries: self.build_entries(index),
+                                            cluster_addr_list: self.converted.clone(),
+                                        });
+                                        let response = client.append_entries(request).await;
+                                        match response {
+                                            Ok(res) => {
+                                                if res.get_ref().success {
+                                                    result_bool = true;
+                                                    self.match_index[index as usize] =
+                                                        self.log.len() as i32 - 1;
+                                                    self.next_index[index as usize] =
+                                                        self.match_index[index as usize] + 1;
+                                                    println!(
+                                                        "my matching index: {0} from thread: {1}",
+                                                        self.match_index[index as usize], index
+                                                    );
+                                                    break;
+                                                } else {
+                                                    result_bool = false;
+                                                    self.next_index[index as usize] -= 1;
+                                                }
+                                            }
+                                            Err(_) => {
+                                                result_bool = false;
+                                            }
+                                        }
                                     }
                                 }
+
+                                let _ = result_sender.send(result_bool);
+                            }
+                            Err(_) => {
+                                let _ = result_sender.send(false);
                             }
                         }
                     }
@@ -509,17 +509,29 @@ impl Node {
             } => match self.cluster_addr_list.get(index as usize) {
                 Some(x) => match self.log.last() {
                     Some(lastlog) => {
-                        let mut client = RaftServiceClient::connect(x.to_string())
-                            .await
-                            .expect("cannot find ip addr");
-                        let request = tonic::Request::new(VoteRequest {
-                            term: self.election_term,
-                            candidate_id: self.address.cluster_idx,
-                            last_log_index: self.log.len() as i32 - 1,
-                            last_log_term: lastlog.term,
-                        });
-                        let response = client.vote_me(request).await;
-                        let _ = result_sender.send(response.unwrap().get_ref().vote_granted);
+                        let conn = RaftServiceClient::connect(x.to_string()).await;
+                        match conn {
+                            Ok(mut client) => {
+                                let request = tonic::Request::new(VoteRequest {
+                                    term: self.election_term,
+                                    candidate_id: self.address.cluster_idx,
+                                    last_log_index: self.log.len() as i32 - 1,
+                                    last_log_term: lastlog.term,
+                                });
+                                let response = client.vote_me(request).await;
+                                match response {
+                                    Ok(result) => {
+                                        let _ = result_sender.send(result.get_ref().vote_granted);
+                                    }
+                                    Err(_) => {
+                                        let _ = result_sender.send(false);
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                let _ = result_sender.send(false);
+                            }
+                        }
                     }
                     None => {
                         let conn = RaftServiceClient::connect(x.to_string()).await;
@@ -566,6 +578,10 @@ impl Node {
                         self.next_index.push(0);
                     }
                 }
+                // println!(
+                //     "syncronize for nextindex: {}",
+                //     self.next_index[self.next_index.len() - 1]
+                // );
                 let _ = result_sender.send(Ok(()));
             }
             Command::ChangeType {
@@ -619,27 +635,43 @@ impl Node {
                 let _ = result_sender.send(self.commit_index);
             }
             Command::ApplyCommittedEntries { result_sender } => {
+                println!(
+                    "debug apply commit : {0} {1}",
+                    (self.last_applied + 1),
+                    self.commit_index
+                );
                 for i in (self.last_applied + 1)..=self.commit_index {
                     if let Some(log) = self.log.get(i as usize) {
-                        match log.log_type {
-                            LogType::PING => {
-                                // TODO
-                            }
-                            LogType::GET => {
-                                // TODO
-                            }
+                        match log.log_type.clone() {
                             LogType::SET => {
                                 // TODO
+                                self.data.insert(log.key.clone(), log.val.clone());
+                                match self.data.get(&log.key) {
+                                    Some(val) => {
+                                        println!("berhasil set, key: {0} value: {1}", log.key, val);
+                                    }
+                                    None => {
+                                        println!("tidak berhasil ke save");
+                                    }
+                                }
                             }
                             LogType::APPEND => {
                                 // TODO
+
+                                let res = self.data.get(&log.key);
+                                match res {
+                                    Some(old_val) => {
+                                        // old_val.push_str(&log.val);
+                                        let new_string = format!("{0}{1}", old_val, log.val);
+                                        self.data.insert(log.key.clone(), new_string);
+                                    }
+                                    None => {}
+                                }
                             }
                             LogType::DEL => {
-                                // TODO
+                                self.data.remove(&log.key);
                             }
-                            LogType::STRLEN => {
-                                // TODO
-                            }
+                            _default => {}
                         }
                     }
                     self.last_applied = i;
@@ -684,9 +716,18 @@ impl Node {
                     let _ = result_sender.send(Ok(val.to_string()));
                 }
                 None => {
+                    println!("kok nggak dapet???? key: {}", key);
                     let _ = result_sender.send(Err(()));
                 }
             },
+            Command::ChangeLog {
+                new_logs,
+                result_sender,
+            } => {
+                self.log = new_logs;
+                println!("change log debug {:?}", self.log);
+                let _ = result_sender.send(Ok(()));
+            }
         }
     }
 }
@@ -738,15 +779,11 @@ impl MyActorHandle {
     }
 
     pub async fn get_address(&self) -> Address {
-        println!("debug11");
         let (send, recv) = oneshot::channel();
-        println!("debug12");
         let msg = Command::GetAddress {
             result_sender: send,
         };
-        println!("debug13");
         let _ = self.sender.send(msg).await;
-        println!("debug14");
         recv.await.expect("Actor task has been killed")
     }
 
@@ -986,6 +1023,15 @@ impl MyActorHandle {
         let _ = self.sender.send(msg).await;
         recv.await.expect("Actor task has been killed")
     }
+    pub async fn change_log(&self, new_logs: Vec<Log>) {
+        let (send, recv) = oneshot::channel();
+        let msg = Command::ChangeLog {
+            new_logs,
+            result_sender: send,
+        };
+        let _ = self.sender.send(msg).await;
+        let _ = recv.await.expect("Actor task has been killed");
+    }
 }
 
 // STRUCT IMPLEMENTATION
@@ -1008,6 +1054,7 @@ impl raft_service::Entries {
                     is_append: false,
                     key: log.key,
                     value: log.val,
+                    term: log.term,
                 }
             }
             LogType::APPEND => {
@@ -1017,6 +1064,7 @@ impl raft_service::Entries {
                     is_append: true,
                     key: log.key,
                     value: log.val,
+                    term: log.term,
                 }
             }
             LogType::DEL => {
@@ -1026,6 +1074,7 @@ impl raft_service::Entries {
                     is_append: false,
                     key: log.key,
                     value: log.val,
+                    term: log.term,
                 }
             }
             _default => {
@@ -1035,6 +1084,7 @@ impl raft_service::Entries {
                     is_append: false,
                     key: log.key,
                     value: log.val,
+                    term: log.term,
                 }
             }
         }
@@ -1042,13 +1092,13 @@ impl raft_service::Entries {
 }
 
 impl Log {
-    pub fn create_from_entries(entries: Entries, term: i32) -> Self {
+    pub fn create_from_entries(entries: Entries) -> Self {
         if entries.is_set {
             return Log {
                 log_type: LogType::SET,
                 key: entries.key,
                 val: entries.value,
-                term,
+                term: entries.term,
             };
         }
         if entries.is_append {
@@ -1056,7 +1106,7 @@ impl Log {
                 log_type: LogType::APPEND,
                 key: entries.key,
                 val: entries.value,
-                term,
+                term: entries.term,
             };
         } else {
             // asumsi gamungkin type lain
@@ -1064,7 +1114,7 @@ impl Log {
                 log_type: LogType::DEL,
                 key: entries.key,
                 val: entries.value,
-                term,
+                term: entries.term,
             };
         }
     }
@@ -1110,7 +1160,15 @@ impl RaftService for MyRaftService {
                     self.handler
                         .push_log(LogType::SET, key.to_string(), val.to_string())
                         .await;
+                    println!(
+                        "apakah berhasil push log? {}",
+                        self.handler.get_log().await.len()
+                    );
                     send_entries(self.handler.clone()).await;
+                    self.handler
+                        .set_commit_index(self.handler.get_log().await.len() as i32 - 1)
+                        .await;
+                    self.handler.apply_committed_entries().await;
                     // ini bisa jadi error ga ya
                     return Ok(Response::new(ClientReply {
                         message: "Success".to_string(),
@@ -1149,44 +1207,138 @@ impl RaftService for MyRaftService {
         &self,
         request: Request<AppendRequest>,
     ) -> Result<Response<AppendReply>, Status> {
-        println!("dapat entry wohooo");
-        // TODO: INI JUGA HARUS FIX SUCCESS HARDCODED JADI TRUE
         let request_raw = request.get_ref();
+
+        //TODO: reply false kalay term < currentTerm
         if self.handler.get_term().await > request_raw.term {
             let reply = AppendReply {
                 term: self.handler.get_term().await,
                 success: false,
             };
-            Ok(Response::new(reply))
-        } else {
-            self.handler.change_type(NodeType::FOLLOWER).await;
-            self.handler.set_term(request_raw.term).await;
-            // request_raw.leader_id
-            println!("i got the leader id: {:?}", request_raw.leader_id);
+            println!("kekirim false1");
+            return Ok(Response::new(reply));
+        }
+        let mut my_logs = self.handler.get_log().await;
 
+        if request_raw.leader_commit > self.handler.get_commit_index().await {
+            println!(
+                "leader commit: {0}, but my log len - 1 is {1}",
+                request_raw.leader_commit,
+                my_logs.len() as i32 - 1
+            );
             self.handler
-                .update_cluster(request_raw.cluster_addr_list.clone())
+                .set_commit_index(cmp::min(
+                    request_raw.leader_commit,
+                    my_logs.len() as i32 - 1,
+                ))
                 .await;
-            self.handler.set_leader(request_raw.leader_id).await;
-            if request_raw.entries.len() == 0 {
+            println!(
+                "my updated commit index? {}",
+                self.handler.get_commit_index().await
+            );
+        }
+
+        // println!("my logs : {:?}", my_logs);
+
+        self.handler.apply_committed_entries().await;
+        if request_raw.entries.len() == 0 {
+            let reply = AppendReply {
+                term: self.handler.get_term().await,
+                success: true,
+            };
+            let _ = self.tx.send(1);
+            return Ok(Response::new(reply));
+        }
+
+        //TODO: cek entry sendiri, self.log[prev_log_index] ada atau nggak, trs cek self.log[prev_log_index].term != prev_log_term then
+        if self.handler.get_log().await.len() != 0 && request_raw.prev_log_index != -1 {
+            if self.handler.get_log().await.len() as i32 > request_raw.prev_log_index {
+                // println!("prev log index debug: {}", request_raw.prev_log_index);
+                if self.handler.get_log().await[request_raw.prev_log_index as usize].term
+                    != request_raw.prev_log_term
+                {
+                    let reply = AppendReply {
+                        term: self.handler.get_term().await,
+                        success: false,
+                    };
+                    println!("kekirim false2");
+                    return Ok(Response::new(reply));
+                }
+            } else {
                 let reply = AppendReply {
                     term: self.handler.get_term().await,
-                    success: true,
+                    success: false,
                 };
-                let _ = self.tx.send(1);
-                Ok(Response::new(reply))
-            } else {
-                //TODO: cek flush commit index
-                let current_term = self.handler.get_term().await;
-
-                let reply = AppendReply {
-                    term: current_term,
-                    success: true,
-                };
-                let _ = self.tx.send(1);
-                Ok(Response::new(reply))
+                println!("kekirim false3");
+                return Ok(Response::new(reply));
             }
         }
+
+        let mut new_logs = Vec::new();
+        for entry in request_raw.entries.clone() {
+            new_logs.push(Log::create_from_entries(entry));
+        }
+
+        let mut ctr = 0;
+
+        //TODO: if content dari self.log[prev_log_index+1] != new_entries[0], and self.log[prev_log_index+1].term != new_entries[0].term (kalo existing)
+        if self.handler.get_log().await.len() as i32 - 1 != request_raw.prev_log_index {
+            let idx = request_raw.prev_log_index as i32 + 1;
+            println!(
+                "idx = {0}, log.len() = {1}",
+                idx,
+                self.handler.get_log().await.len(),
+            );
+            if self.handler.get_log().await[idx as usize] != new_logs[0] {
+                for i in request_raw.prev_log_index as usize + 1..self.handler.get_log().await.len()
+                {
+                    println!("prev log index debug: {}", request_raw.prev_log_index);
+                    my_logs[i] = new_logs[ctr].clone();
+                    ctr += 1;
+                }
+            }
+        }
+
+        //TODO: kalo ga existing di push (append)
+        for i in ctr..new_logs.len() {
+            my_logs.push(new_logs[i].clone());
+        }
+        println!("my logs : {:?}", my_logs);
+
+        self.handler.change_log(my_logs.clone()).await;
+
+        //TODO: kalau request.leader_commit > self.commit_index, set commit_index = min(leader
+        //commit dengan index of last index), trs langsung apply commit
+
+        if request_raw.leader_commit > self.handler.get_commit_index().await {
+            self.handler
+                .set_commit_index(cmp::min(
+                    request_raw.leader_commit,
+                    my_logs.len() as i32 - 1,
+                ))
+                .await;
+        }
+
+        self.handler.apply_committed_entries().await;
+
+        // request_raw.leader_id
+        // println!("i got the leader id: {:?}", request_raw.leader_id);
+        self.handler.change_type(NodeType::FOLLOWER).await;
+        self.handler.set_term(request_raw.term).await;
+        self.handler
+            .update_cluster(request_raw.cluster_addr_list.clone())
+            .await;
+        self.handler.set_leader(request_raw.leader_id).await;
+
+        //TODO: cek flush commit index
+        let current_term = self.handler.get_term().await;
+
+        let reply = AppendReply {
+            term: current_term,
+            success: true,
+        };
+        let _ = self.tx.send(1);
+        Ok(Response::new(reply))
     }
 
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
@@ -1210,7 +1362,6 @@ impl RaftService for MyRaftService {
         }
 
         println!("dapet vote me niii: {:?}", request_raw);
-        println!("cek: {:?}", self.handler);
         println!(
             "my cluster idx: {}",
             self.handler.get_address().await.cluster_idx
@@ -1412,8 +1563,8 @@ async fn sender(
                     {
                         actor_handler.change_type(NodeType::LEADER).await;
                         actor_handler.reinit().await;
+                        println!("lewat sini ga3?");
                     }
-                    println!("lewat sini ga3?");
                 };
 
                 tokio::select! {

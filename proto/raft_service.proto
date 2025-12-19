@@ -37,6 +37,7 @@ message Entries {
 	bool isAppend = 4;
 	string key = 5;
 	string value = 6;
+  int32 term = 7;
 }
 
 message AppendRequest {
