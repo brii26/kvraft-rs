@@ -147,6 +147,15 @@ impl State {
                 break;
             }
             let e = self.log[i].clone();
+            println!(
+                "[APPLY] idx={} term={} cmd={:?} key='{}' val='{}'",
+                i,
+                e.term,
+                cmd_from_i32(e.cmd),
+                e.key,
+                e.value
+            );
+
             match cmd_from_i32(e.cmd) {
                 CommandType::CmdSet => {
                     self.kv.insert(e.key, e.value);
@@ -190,8 +199,7 @@ impl State {
                         }
                     }
                 }
-                _ => {
-                }
+                _ => {}
             }
         }
     }
@@ -425,6 +433,15 @@ impl MyRaftService {
         if !is_leader {
             return;
         }
+        let (me_s, term, cluster_n) = {
+            let st = shared.st.lock().await;
+            (
+                format!("{}:{}", st.me.ip, st.me.port),
+                st.current_term,
+                st.cluster.len(),
+            )
+        };
+        println!("[HB] leader={} term={} cluster_n={}", me_s, term, cluster_n);
 
         let peers: Vec<usize> = {
             let mut st = shared.st.lock().await;
@@ -815,8 +832,18 @@ impl RaftService for MyRaftService {
         let voted_ok = st.voted_for.is_none() || st.voted_for == Some(req.candidate_id);
 
         let grant = voted_ok && up_to_date;
+
         if grant {
             st.voted_for = Some(req.candidate_id);
+        } else {
+            println!(
+                "[VOTE-REJECT] me={} term={} cand={} voted_for={:?} up_to_date={}",
+                format!("{}:{}", st.me.ip, st.me.port),
+                st.current_term,
+                req.candidate_id,
+                st.voted_for,
+                up_to_date
+            );
         }
 
         Ok(Response::new(VoteReply {
@@ -930,7 +957,7 @@ async fn join_cluster(shared: Shared, seed_leader: Addr) {
             }
         }
 
-        {
+        let (join_idx, leader_s, cluster_n) = {
             let mut st = shared.st.lock().await;
             st.cluster = reply
                 .cluster_config
@@ -958,9 +985,22 @@ async fn join_cluster(shared: Shared, seed_leader: Addr) {
 
             st.role = Role::Follower;
             st.last_heartbeat = Instant::now();
-        }
 
-        println!("Joined cluster successfully.");
+            let idx = st.me.cluster_idx;
+            let ls = st
+                .leader
+                .as_ref()
+                .map(|a| format!("{}:{}", a.ip, a.port))
+                .unwrap_or_else(|| "unknown".to_string());
+            let n = st.cluster.len();
+            (idx, ls, n)
+        };
+
+        println!(
+            "[JOIN] idx={} leader={} cluster_n={}",
+            join_idx, leader_s, cluster_n
+        );
+
         return;
     }
 }
@@ -1008,6 +1048,7 @@ async fn election_task(shared: Shared) {
             let st = shared.st.lock().await;
             st.current_term
         };
+        println!("[ELECT-START] term={} self_vote={}", my_term, me_idx);
 
         let mut tasks = Vec::new();
         for p in peers.iter() {
@@ -1026,6 +1067,10 @@ async fn election_task(shared: Shared) {
             tasks.push(tokio::spawn(async move {
                 let mut client = RaftServiceClient::connect(addr.uri()).await.ok()?;
                 let r = client.vote_me(Request::new(req)).await.ok()?.into_inner();
+                println!(
+                    "[VOTE-RESP] from {}:{} grant={} term={}",
+                    addr.ip, addr.port, r.vote_granted, r.term
+                );
 
                 {
                     let mut st = shared2.st.lock().await;
@@ -1157,6 +1202,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         match_index: vec![],
         last_heartbeat: Instant::now(),
     };
+
+    println!(
+        "[BOOT] me={} role={:?} term={} leader={}",
+        format!("{}:{}", ip, port),
+        &state.role,
+        state.current_term,
+        state
+            .leader
+            .as_ref()
+            .map(|a| format!("{}:{}", a.ip, a.port))
+            .unwrap_or_else(|| "none".to_string())
+    );
 
     let shared = Shared {
         st: Arc::new(Mutex::new(state)),
