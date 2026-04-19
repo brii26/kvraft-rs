@@ -113,12 +113,15 @@ impl State {
 
     fn ensure_leader_arrays(&mut self) {
         let n = self.cluster.len();
-        if self.next_index.len() != n {
-            self.next_index = vec![self.log.len() as i32; n];
+        let log_len = self.log.len() as i32;
+        while self.next_index.len() < n {
+            self.next_index.push(log_len);
         }
-        if self.match_index.len() != n {
-            self.match_index = vec![-1; n];
+        self.next_index.truncate(n);
+        while self.match_index.len() < n {
+            self.match_index.push(-1);
         }
+        self.match_index.truncate(n);
         if self.me.cluster_idx >= 0 {
             let i = self.me.cluster_idx as usize;
             if i < self.match_index.len() {
