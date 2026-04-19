@@ -1,1 +1,0 @@
-{"current_term":1,"voted_for":0,"log":[{"cmd":3,"key":"foo","value":"bar","term":1},{"cmd":3,"key":"hello","value":"world","term":1},{"cmd":4,"key":"foo","value":"XYZ","term":1},{"cmd":3,"key":"fresh","value":"new_after_restart","term":1}],"cluster":[{"ip":"127.0.0.1","port":"50051"},{"ip":"127.0.0.1","port":"50052"}]}
