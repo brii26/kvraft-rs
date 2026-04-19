@@ -910,13 +910,12 @@ impl RaftService for MyRaftService {
 }
 
 async fn join_cluster(shared: Shared, seed_leader: Addr) {
+    let mut leader = seed_leader;
     loop {
         let me = {
             let st = shared.st.lock().await;
             st.me.clone()
         };
-
-        let mut leader = seed_leader.clone();
 
         let conn = RaftServiceClient::connect(leader.uri()).await;
         let mut client = match conn {
