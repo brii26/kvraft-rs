@@ -174,8 +174,16 @@ impl State {
                 CommandType::CmdRemoveMember => {
                     if let Ok(node_id) = e.value.parse::<i32>() {
                         if node_id >= 0 && (node_id as usize) < self.cluster.len() {
-                            let remove_addr = self.cluster[node_id as usize].clone();
-                            self.cluster.remove(node_id as usize);
+                            let rm = node_id as usize;
+                            let remove_addr = self.cluster[rm].clone();
+                            self.cluster.remove(rm);
+
+                            if rm < self.next_index.len() {
+                                self.next_index.remove(rm);
+                            }
+                            if rm < self.match_index.len() {
+                                self.match_index.remove(rm);
+                            }
 
                             if let Some(ld) = self.leader.clone() {
                                 if ld.equals_no_idx(&remove_addr) {
@@ -193,8 +201,6 @@ impl State {
                                 self.voted_for = None;
                             }
 
-                            self.next_index.truncate(self.cluster.len());
-                            self.match_index.truncate(self.cluster.len());
                             self.ensure_leader_arrays();
                         }
                     }
