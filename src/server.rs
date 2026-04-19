@@ -1112,7 +1112,6 @@ async fn election_task(shared: Shared) {
                 );
             } else {
                 st.role = Role::Follower;
-                st.voted_for = None;
                 st.last_heartbeat = Instant::now();
                 println!("Election failed. term={} votes={}", st.current_term, votes);
             }
