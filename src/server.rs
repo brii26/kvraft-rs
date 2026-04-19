@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::env;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use tokio::signal;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration, Instant};
@@ -54,6 +57,38 @@ fn cmd_from_i32(v: i32) -> CommandType {
     CommandType::try_from(v).unwrap_or(CommandType::CmdUnknown)
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedAddr {
+    ip: String,
+    port: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct PersistedEntry {
+    cmd: i32,
+    key: String,
+    value: String,
+    term: i32,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Snapshot {
+    current_term: i32,
+    voted_for: Option<i32>,
+    log: Vec<PersistedEntry>,
+    cluster: Vec<PersistedAddr>,
+}
+
+fn state_path(port: &str) -> PathBuf {
+    PathBuf::from(format!("state-{}.json", port))
+}
+
+fn load_snapshot(port: &str) -> Option<Snapshot> {
+    let path = state_path(port);
+    let data = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&data).ok()
+}
+
 fn last_log_term(log: &[LogEntry]) -> i32 {
     log.last().map(|e| e.term).unwrap_or(-1)
 }
@@ -88,6 +123,41 @@ struct State {
 impl State {
     fn majority(&self) -> usize {
         (self.cluster.len() / 2) + 1
+    }
+
+    fn persist(&self) {
+        let snap = Snapshot {
+            current_term: self.current_term,
+            voted_for: self.voted_for,
+            log: self
+                .log
+                .iter()
+                .map(|e| PersistedEntry {
+                    cmd: e.cmd,
+                    key: e.key.clone(),
+                    value: e.value.clone(),
+                    term: e.term,
+                })
+                .collect(),
+            cluster: self
+                .cluster
+                .iter()
+                .map(|a| PersistedAddr {
+                    ip: a.ip.clone(),
+                    port: a.port.clone(),
+                })
+                .collect(),
+        };
+        let path = state_path(&self.me.port);
+        let data = match serde_json::to_string(&snap) {
+            Ok(d) => d,
+            Err(_) => return,
+        };
+        let tmp = path.with_extension("json.tmp");
+        if fs::write(&tmp, data).is_err() {
+            return;
+        }
+        let _ = fs::rename(&tmp, &path);
     }
 
     fn recompute_cluster_indices(&mut self) {
@@ -139,10 +209,13 @@ impl State {
             term: self.current_term,
         };
         self.log.push(entry);
-        last_log_index(&self.log)
+        let idx = last_log_index(&self.log);
+        self.persist();
+        idx
     }
 
     fn apply_commits(&mut self) {
+        let mut cluster_changed = false;
         while self.last_applied < self.commit_index {
             self.last_applied += 1;
             let i = self.last_applied as usize;
@@ -180,6 +253,7 @@ impl State {
                             let rm = node_id as usize;
                             let remove_addr = self.cluster[rm].clone();
                             self.cluster.remove(rm);
+                            cluster_changed = true;
 
                             if rm < self.next_index.len() {
                                 self.next_index.remove(rm);
@@ -210,6 +284,9 @@ impl State {
                 }
                 _ => {}
             }
+        }
+        if cluster_changed {
+            self.persist();
         }
     }
 
@@ -352,6 +429,7 @@ impl MyRaftService {
                     st.role = Role::Follower;
                     st.voted_for = None;
                     st.leader = None;
+                    st.persist();
                     return false;
                 }
 
@@ -766,12 +844,14 @@ impl RaftService for MyRaftService {
         if req.prev_log_index >= 0 {
             let pli = req.prev_log_index as usize;
             if pli >= st.log.len() {
+                st.persist();
                 return Ok(Response::new(AppendReply {
                     term: st.current_term,
                     success: false,
                 }));
             }
             if st.log[pli].term != req.prev_log_term {
+                st.persist();
                 return Ok(Response::new(AppendReply {
                     term: st.current_term,
                     success: false,
@@ -798,6 +878,7 @@ impl RaftService for MyRaftService {
         if req.leader_commit > st.commit_index {
             st.commit_index = std::cmp::min(req.leader_commit, last_idx);
         }
+        st.persist();
         st.apply_commits();
 
         Ok(Response::new(AppendReply {
@@ -855,6 +936,8 @@ impl RaftService for MyRaftService {
             );
         }
 
+        st.persist();
+
         Ok(Response::new(VoteReply {
             term: st.current_term,
             vote_granted: grant,
@@ -905,6 +988,7 @@ impl RaftService for MyRaftService {
         st.cluster.push(new_addr);
         st.recompute_cluster_indices();
         st.ensure_leader_arrays();
+        st.persist();
 
         let assigned_id = (st.cluster.len() as i32) - 1;
         let cfg = st.cluster.iter().map(|a| a.to_proto()).collect::<Vec<_>>();
@@ -994,6 +1078,7 @@ async fn join_cluster(shared: Shared, seed_leader: Addr) {
 
             st.role = Role::Follower;
             st.last_heartbeat = Instant::now();
+            st.persist();
 
             let idx = st.me.cluster_idx;
             let ls = st
@@ -1051,6 +1136,7 @@ async fn election_task(shared: Shared) {
             st.current_term += 1;
             st.voted_for = Some(st.me.cluster_idx);
             st.last_heartbeat = Instant::now();
+            st.persist();
         }
 
         let my_term = {
@@ -1088,6 +1174,7 @@ async fn election_task(shared: Shared) {
                         st.role = Role::Follower;
                         st.voted_for = None;
                         st.leader = None;
+                        st.persist();
                     }
                 }
 
@@ -1147,69 +1234,125 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ip = args[1].clone();
     let port = args[2].clone();
 
-    let me = Addr {
-        ip: ip.clone(),
-        port: port.clone(),
-        cluster_idx: -1,
-    };
+    let snapshot = load_snapshot(&port);
 
-    let is_leader_start = args.len() == 3;
-    let seed_leader = if !is_leader_start {
-        Some(Addr {
-            ip: args[3].clone(),
-            port: args[4].clone(),
-            cluster_idx: -1,
-        })
-    } else {
-        None
-    };
-
-    let initial_cluster = if is_leader_start {
-        vec![Addr {
-            ip: ip.clone(),
-            port: port.clone(),
-            cluster_idx: 0,
-        }]
-    } else {
-        vec![]
-    };
-
-    let state = State {
-        me: if is_leader_start {
-            Addr {
+    let (state, seed_for_join) = if let Some(snap) = snapshot {
+        let cluster: Vec<Addr> = snap
+            .cluster
+            .iter()
+            .enumerate()
+            .map(|(i, a)| Addr {
+                ip: a.ip.clone(),
+                port: a.port.clone(),
+                cluster_idx: i as i32,
+            })
+            .collect();
+        let log: Vec<LogEntry> = snap
+            .log
+            .into_iter()
+            .map(|e| LogEntry {
+                cmd: e.cmd,
+                key: e.key,
+                value: e.value,
+                term: e.term,
+            })
+            .collect();
+        let mut state = State {
+            me: Addr {
                 ip: ip.clone(),
                 port: port.clone(),
-                cluster_idx: 0,
-            }
-        } else {
-            me.clone()
-        },
-        is_member: is_leader_start,
-        role: if is_leader_start {
-            Role::Leader
-        } else {
-            Role::Follower
-        },
-        current_term: if is_leader_start { 1 } else { 0 },
-        voted_for: if is_leader_start { Some(0) } else { None },
-        leader: if is_leader_start {
+                cluster_idx: -1,
+            },
+            is_member: false,
+            role: Role::Follower,
+            current_term: snap.current_term,
+            voted_for: snap.voted_for,
+            leader: None,
+            cluster,
+            log,
+            commit_index: -1,
+            last_applied: -1,
+            kv: HashMap::new(),
+            next_index: vec![],
+            match_index: vec![],
+            last_heartbeat: Instant::now(),
+        };
+        state.recompute_cluster_indices();
+        println!(
+            "[RESTORE] term={} log_len={} cluster_n={} is_member={} voted_for={:?}",
+            state.current_term,
+            state.log.len(),
+            state.cluster.len(),
+            state.is_member,
+            state.voted_for
+        );
+        (state, None)
+    } else {
+        let is_leader_start = args.len() == 3;
+        let seed_leader = if !is_leader_start {
             Some(Addr {
-                ip: ip.clone(),
-                port: port.clone(),
-                cluster_idx: 0,
+                ip: args[3].clone(),
+                port: args[4].clone(),
+                cluster_idx: -1,
             })
         } else {
-            seed_leader.clone()
-        },
-        cluster: initial_cluster,
-        log: vec![],
-        commit_index: -1,
-        last_applied: -1,
-        kv: HashMap::new(),
-        next_index: vec![],
-        match_index: vec![],
-        last_heartbeat: Instant::now(),
+            None
+        };
+
+        let initial_cluster = if is_leader_start {
+            vec![Addr {
+                ip: ip.clone(),
+                port: port.clone(),
+                cluster_idx: 0,
+            }]
+        } else {
+            vec![]
+        };
+
+        let state = State {
+            me: if is_leader_start {
+                Addr {
+                    ip: ip.clone(),
+                    port: port.clone(),
+                    cluster_idx: 0,
+                }
+            } else {
+                Addr {
+                    ip: ip.clone(),
+                    port: port.clone(),
+                    cluster_idx: -1,
+                }
+            },
+            is_member: is_leader_start,
+            role: if is_leader_start {
+                Role::Leader
+            } else {
+                Role::Follower
+            },
+            current_term: if is_leader_start { 1 } else { 0 },
+            voted_for: if is_leader_start { Some(0) } else { None },
+            leader: if is_leader_start {
+                Some(Addr {
+                    ip: ip.clone(),
+                    port: port.clone(),
+                    cluster_idx: 0,
+                })
+            } else {
+                seed_leader.clone()
+            },
+            cluster: initial_cluster,
+            log: vec![],
+            commit_index: -1,
+            last_applied: -1,
+            kv: HashMap::new(),
+            next_index: vec![],
+            match_index: vec![],
+            last_heartbeat: Instant::now(),
+        };
+        (state, seed_leader)
     };
+
+    state.persist();
 
     println!(
         "[BOOT] me={} role={:?} term={} leader={}",
@@ -1228,7 +1371,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         repl_lock: Arc::new(Mutex::new(())),
     };
 
-    if let Some(ld) = seed_leader {
+    if let Some(ld) = seed_for_join {
         let shared2 = shared.clone();
         tokio::spawn(async move {
             join_cluster(shared2, ld).await;
