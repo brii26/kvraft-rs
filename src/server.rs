@@ -1,3 +1,8 @@
+// Raft server + in-memory key/value store.
+// Each node keeps a replicated log. The leader accepts writes, copies them to
+// followers, and once a majority has a write it is "committed" and applied to
+// the kv map. Nodes elect a new leader if the current one goes quiet.
+
 use std::collections::HashMap;
 use std::env;
 use std::fs;
@@ -17,10 +22,16 @@ use raft_service::{
     MembershipReply, MembershipRequest, RequestLogReply, RequestLogRequest, VoteReply, VoteRequest,
 };
 
+// gRPC types generated from the .proto file at build time.
 pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
 
+// ---------------------------------------------------------------------------
+// Basic types
+// ---------------------------------------------------------------------------
+
+// A node is exactly one of these at any time.
 #[derive(Clone, Debug, PartialEq)]
 enum Role {
     Leader,
@@ -28,6 +39,7 @@ enum Role {
     Follower,
 }
 
+// Network address of a node plus its slot number in the cluster list.
 #[derive(Clone, Debug, PartialEq)]
 struct Addr {
     ip: String,
@@ -53,9 +65,15 @@ impl Addr {
     }
 }
 
+// Turn a raw i32 from the wire back into a command enum.
 fn cmd_from_i32(v: i32) -> CommandType {
     CommandType::try_from(v).unwrap_or(CommandType::CmdUnknown)
 }
+
+// ---------------------------------------------------------------------------
+// On-disk state
+// These structs are what we save to state-<port>.json so a node can restart.
+// ---------------------------------------------------------------------------
 
 #[derive(Serialize, Deserialize, Clone)]
 struct PersistedAddr {
@@ -71,6 +89,7 @@ struct PersistedEntry {
     term: i32,
 }
 
+// The full saved state written to disk as one JSON file.
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     current_term: i32,
@@ -79,52 +98,71 @@ struct Snapshot {
     cluster: Vec<PersistedAddr>,
 }
 
+// File name we save state to, one per port so nodes do not clash.
 fn state_path(port: &str) -> PathBuf {
     PathBuf::from(format!("state-{}.json", port))
 }
 
+// Read saved state from disk, or None if there is no file yet.
 fn load_snapshot(port: &str) -> Option<Snapshot> {
     let path = state_path(port);
     let data = fs::read_to_string(&path).ok()?;
     serde_json::from_str(&data).ok()
 }
 
+// Term of the newest log entry, or -1 if the log is empty.
 fn last_log_term(log: &[LogEntry]) -> i32 {
     log.last().map(|e| e.term).unwrap_or(-1)
 }
 
+// Index of the newest log entry, or -1 if the log is empty.
 fn last_log_index(log: &[LogEntry]) -> i32 {
     (log.len() as i32) - 1
 }
 
+// ---------------------------------------------------------------------------
+// Node state
+// Everything one running node needs to know. Lives behind a Mutex so the RPC
+// handlers and the background tasks can share it safely.
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 struct State {
+    // Who am I, and am I still part of the cluster.
     me: Addr,
     is_member: bool,
 
+    // Election state.
     role: Role,
     current_term: i32,
     voted_for: Option<i32>,
     leader: Option<Addr>,
 
+    // All nodes in the cluster, in order.
     cluster: Vec<Addr>,
 
+    // The replicated log and the kv map built by applying it.
     log: Vec<LogEntry>,
-    commit_index: i32,
-    last_applied: i32,
+    commit_index: i32,  // highest log index known to be safely stored
+    last_applied: i32,  // highest log index already run into kv
     kv: HashMap<String, String>,
 
+    // Leader-only bookkeeping, per follower, what to send next and what it has.
     next_index: Vec<i32>,
     match_index: Vec<i32>,
 
+    // Last time we heard from a leader, used to start elections.
     last_heartbeat: Instant,
 }
 
 impl State {
+    // How many nodes count as a majority of the cluster.
     fn majority(&self) -> usize {
         (self.cluster.len() / 2) + 1
     }
 
+    // Save the important state to disk. Write to a temp file then rename so a
+    // crash mid-write cannot corrupt the real file.
     fn persist(&self) {
         let snap = Snapshot {
             current_term: self.current_term,
@@ -160,6 +198,8 @@ impl State {
         let _ = fs::rename(&tmp, &path);
     }
 
+    // Renumber every node by its position, then find my own slot and the
+    // leader's slot. Call this whenever the cluster list changes.
     fn recompute_cluster_indices(&mut self) {
         for (i, a) in self.cluster.iter_mut().enumerate() {
             a.cluster_idx = i as i32;
@@ -181,6 +221,8 @@ impl State {
         }
     }
 
+    // Make sure next_index and match_index have one slot per node, growing or
+    // shrinking to match the cluster size. My own slot points at my log end.
     fn ensure_leader_arrays(&mut self) {
         let n = self.cluster.len();
         let log_len = self.log.len() as i32;
@@ -201,6 +243,7 @@ impl State {
         }
     }
 
+    // Add one new entry to the leader's log and save. Returns its index.
     fn append_entry(&mut self, cmd: CommandType, key: String, value: String) -> i32 {
         let entry = LogEntry {
             cmd: cmd as i32,
@@ -214,6 +257,8 @@ impl State {
         idx
     }
 
+    // Run every committed but not-yet-applied entry into the kv map.
+    // Also handles removing a member from the cluster.
     fn apply_commits(&mut self) {
         let mut cluster_changed = false;
         while self.last_applied < self.commit_index {
@@ -290,6 +335,8 @@ impl State {
         }
     }
 
+    // Leader moves commit_index forward, an entry is committed once a majority
+    // of nodes have it and it belongs to the current term.
     fn advance_commit_index(&mut self) {
         let mut n = self.commit_index + 1;
         let last = last_log_index(&self.log);
@@ -308,18 +355,30 @@ impl State {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared handles
+// ---------------------------------------------------------------------------
+
+// State shared between all tasks. repl_lock keeps replication rounds from
+// stepping on each other.
 #[derive(Clone)]
 struct Shared {
     st: Arc<Mutex<State>>,
     repl_lock: Arc<Mutex<()>>,
 }
 
+// The gRPC service. Holds the shared state and implements every RPC.
 #[derive(Clone)]
 struct MyRaftService {
     shared: Shared,
 }
 
+// ---------------------------------------------------------------------------
+// Replication helpers (leader side)
+// ---------------------------------------------------------------------------
+
 impl MyRaftService {
+    // Build a "not leader, go here instead" reply for write requests.
     async fn redirect_reply(&self) -> ExecuteReply {
         let st = self.shared.st.lock().await;
         let leader = st
@@ -334,6 +393,7 @@ impl MyRaftService {
         }
     }
 
+    // Same redirect, but for a request_log call.
     async fn redirect_log_reply(&self) -> RequestLogReply {
         let st = self.shared.st.lock().await;
         let leader = st
@@ -348,6 +408,9 @@ impl MyRaftService {
         }
     }
 
+    // Push log entries to one follower until it has caught up to need_index.
+    // On a rejection we step next_index back and retry with an earlier point.
+    // Returns true if that follower reached need_index.
     async fn replicate_peer_to_end(
         shared: Shared,
         peer_idx: usize,
@@ -453,6 +516,8 @@ impl MyRaftService {
         }
     }
 
+    // Send a new entry to all followers in parallel and wait for a majority.
+    // Once enough have it, advance commit_index and apply. Returns commit ok.
     async fn replicate_to_majority(&self, need_index: i32) -> bool {
         let _guard = self.shared.repl_lock.lock().await;
 
@@ -510,6 +575,8 @@ impl MyRaftService {
         false
     }
 
+    // Leader sends a round of AppendEntries to everyone. This doubles as the
+    // heartbeat that stops followers from starting a new election.
     async fn send_heartbeat_round(shared: Shared) {
         let _guard = shared.repl_lock.lock().await;
 
@@ -562,8 +629,15 @@ impl MyRaftService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// RPC handlers
+// These are the calls other nodes and clients make to this node.
+// ---------------------------------------------------------------------------
+
 #[tonic::async_trait]
 impl RaftService for MyRaftService {
+    // Client entry point. Reads run locally, writes go through the log.
+    // Non-leaders reply with a redirect to the leader.
     async fn execute(
         &self,
         request: Request<ExecuteRequest>,
@@ -747,6 +821,8 @@ impl RaftService for MyRaftService {
         }
     }
 
+    // Return the leader's full log to a client, after committing a marker
+    // entry so the reply reflects an up-to-date leader.
     async fn request_log(
         &self,
         _request: Request<RequestLogRequest>,
@@ -798,6 +874,9 @@ impl RaftService for MyRaftService {
         }))
     }
 
+    // Follower side of replication. Reject old terms, adopt the leader, check
+    // that our log lines up at prev_log_index, then append the new entries and
+    // move our commit_index forward.
     async fn append_entries(
         &self,
         request: Request<AppendRequest>,
@@ -819,6 +898,7 @@ impl RaftService for MyRaftService {
             st.voted_for = None;
         }
 
+        // Adopt the cluster list the leader sent us.
         if !req.cluster_config.is_empty() {
             st.cluster = req
                 .cluster_config
@@ -841,6 +921,8 @@ impl RaftService for MyRaftService {
 
         st.role = Role::Follower;
 
+        // Our log must match the leader at prev_log_index or we reject so the
+        // leader backs up and tries an earlier point.
         if req.prev_log_index >= 0 {
             let pli = req.prev_log_index as usize;
             if pli >= st.log.len() {
@@ -859,6 +941,8 @@ impl RaftService for MyRaftService {
             }
         }
 
+        // Write the new entries. If an existing entry disagrees on term, drop
+        // it and everything after, then take the leader's version.
         let mut insert_at = (req.prev_log_index + 1) as usize;
 
         for incoming in req.entries.iter() {
@@ -887,6 +971,8 @@ impl RaftService for MyRaftService {
         }))
     }
 
+    // Handle a vote request. Grant a vote only if we have not voted this term
+    // and the candidate's log is at least as up to date as ours.
     async fn vote_me(&self, request: Request<VoteRequest>) -> Result<Response<VoteReply>, Status> {
         let req = request.into_inner();
         let mut st = self.shared.st.lock().await;
@@ -944,6 +1030,8 @@ impl RaftService for MyRaftService {
         }))
     }
 
+    // A new node asks to join. Only the leader can add it. We append it to the
+    // cluster list, give it a slot number, and return the new config.
     async fn membership(
         &self,
         request: Request<MembershipRequest>,
@@ -1002,6 +1090,12 @@ impl RaftService for MyRaftService {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Background tasks
+// ---------------------------------------------------------------------------
+
+// A fresh node calls the seed leader to join. It keeps trying and follows
+// redirects until the real leader accepts it and returns the cluster config.
 async fn join_cluster(shared: Shared, seed_leader: Addr) {
     let mut leader = seed_leader;
     loop {
@@ -1099,6 +1193,9 @@ async fn join_cluster(shared: Shared, seed_leader: Addr) {
     }
 }
 
+// Runs forever. If we go too long without hearing from a leader, become a
+// candidate, bump the term, ask everyone for votes, and if we win a majority
+// we become leader.
 async fn election_task(shared: Shared) {
     let mut timeout_ms: u64 = rand::random_range(4500..5000);
 
@@ -1217,6 +1314,7 @@ async fn election_task(shared: Shared) {
     }
 }
 
+// Runs forever. Once a second, if we are leader, send a heartbeat round.
 async fn heartbeat_task(shared: Shared) {
     loop {
         sleep(Duration::from_millis(1000)).await;
@@ -1224,6 +1322,12 @@ async fn heartbeat_task(shared: Shared) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Startup
+// ---------------------------------------------------------------------------
+
+// Parse args, load saved state or build fresh state, start the background
+// tasks, and run the gRPC server until Ctrl+C.
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -1236,6 +1340,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let snapshot = load_snapshot(&port);
 
+    // Two ways to start, restore from a saved file, or start brand new.
+    // A new node with no leader args starts as a one-node leader, otherwise it
+    // starts as a follower that will join the given seed leader.
     let (state, seed_for_join) = if let Some(snap) = snapshot {
         let cluster: Vec<Addr> = snap
             .cluster

@@ -1,11 +1,22 @@
+// Interactive CLI client for the kv store.
+// It reads commands from the terminal and sends them to a server over gRPC.
+// If the server is not the leader it tells us the leader, and we retry there.
+
 use raft_service::raft_service_client::RaftServiceClient;
 use raft_service::{CommandType, ExecuteRequest, RequestLogRequest};
 use std::env;
 
+// gRPC types generated from the .proto file at build time.
 pub mod raft_service {
     tonic::include_proto!("raft_service");
 }
 
+// ---------------------------------------------------------------------------
+// Input parsing
+// ---------------------------------------------------------------------------
+
+// Split a line into words. Text inside double quotes stays as one word,
+// and a backslash inside quotes escapes the next character.
 fn tokenize(input: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -49,12 +60,20 @@ fn tokenize(input: &str) -> Result<Vec<String>, String> {
     Ok(out)
 }
 
+// ---------------------------------------------------------------------------
+// Network calls
+// ---------------------------------------------------------------------------
+
+// Open a gRPC connection to the given address.
 async fn connect(addr: &str) -> Result<RaftServiceClient<tonic::transport::Channel>, String> {
     RaftServiceClient::connect(addr.to_string())
         .await
         .map_err(|e| format!("Cannot connect to server: {e}"))
 }
 
+// Send a command and follow leader redirects.
+// If the server says "not leader" we switch to the leader it names and try again.
+// We give up after 5 hops so we never loop forever.
 async fn exec_with_redirect(
     client: &mut Option<RaftServiceClient<tonic::transport::Channel>>,
     target_addr: &mut String,
@@ -87,6 +106,7 @@ async fn exec_with_redirect(
     Err("Too many redirects".to_string())
 }
 
+// Ask the leader for the full replicated log. Same redirect logic as above.
 async fn request_log_with_redirect(
     client: &mut Option<RaftServiceClient<tonic::transport::Channel>>,
     target_addr: &mut String,
@@ -121,6 +141,11 @@ async fn request_log_with_redirect(
     Err("Too many redirects".to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Command loop
+// ---------------------------------------------------------------------------
+
+// Print the list of commands the user can type.
 fn print_help() {
     println!("Commands:");
     println!("  ping");
@@ -142,11 +167,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         panic!("Use: cargo run --bin client <ip-addr> <port>");
     }
 
+    // Address we currently talk to, and a cached connection to it.
     let mut target_addr = format!("http://{}:{}", args[1], args[2]);
     let mut client: Option<RaftServiceClient<tonic::transport::Channel>> = None;
 
     print_help();
 
+    // Read one line at a time, parse it, and run the matching command.
     loop {
         use std::io::{self, Write};
         print!("❯ ");
@@ -173,6 +200,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        // "change" points the client at a different server without restarting.
         if cmd == "change" {
             if tokens.len() != 3 {
                 println!("Usage: change <ip> <port>");
@@ -205,6 +233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
+        // Build one request and fill it based on which command was typed.
         let mut req = ExecuteRequest {
             cmd: CommandType::CmdUnknown as i32,
             key: "".to_string(),
@@ -212,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             node_id: -1,
         };
 
+        // Check argument count, then set the command type and fields.
         match cmd {
             "ping" => {
                 if tokens.len() != 1 {
@@ -283,6 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
+        // Send the request and print whatever the leader replies.
         match exec_with_redirect(&mut client, &mut target_addr, req).await {
             Ok(msg) => println!("{msg}"),
             Err(e) => println!("{e}"),
