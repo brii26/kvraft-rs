@@ -30,22 +30,21 @@ A distributed key-value store built on the **Raft consensus algorithm**, impleme
 flowchart LR
     Client([Client CLI])
 
-    subgraph Cluster [ ]
-        direction TB
-        Leader[Leader]
-        F1[Follower]
-        F2[Follower]
-
-        Leader ---> LS[(state-50051.json)]
-        F1 ---> S1[(state-50052.json)]
-        F2 ---> S2[(state-50053.json)]
-    end
-
     Client -->|Execute / RequestLog| Leader
     Client -.->|redirect to leader| Leader
 
+    subgraph Cluster [ ]
+        Leader[Leader]
+        F1[Follower]
+        F2[Follower]
+    end
+
     Leader ==>|AppendEntries + heartbeat| F1
     Leader ==>|AppendEntries + heartbeat| F2
+
+    Leader --> LS[(state-50051.json)]
+    F1 --> S1[(state-50052.json)]
+    F2 --> S2[(state-50053.json)]
 ```
 
 **Normal operation:** the client sends commands to the leader (if it hits a follower it is redirected, up to 5 hops). The leader appends each write to its log and replicates it to followers via `AppendEntries`. Once a majority store an entry it is committed and applied to the in-memory KV store. Every node flushes its term, vote, log, and cluster config to `state-<port>.json` before replying.

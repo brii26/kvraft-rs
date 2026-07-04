@@ -1,6 +1,7 @@
 target
 /Cargo.lock
 state-*.json
+unhandled.md
 **/*.rs.bk
 /OUT_DIR/
 /generated/
